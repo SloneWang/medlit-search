@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 工作流产物（如需跟踪示例产物可移除本节）
+papers/
+exports/
+results.json
+screening.json
+selected.json
+mesh_check.json
+query.txt
+terms.txt
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
