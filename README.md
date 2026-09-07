@@ -16,9 +16,11 @@
 ## 特性
 
 - 🔍 **PubMed 检索**：E-utilities 分页检索 + MEDLINE 全文级元数据拉取，内置限流（3 req/s，配 API key 后 10 req/s）与重试
+- 📥 **题录导入**：RIS / BibTeX / PubMed MEDLINE 导入为统一 JSON，**摘要完整保留**
+- 🔎 **摘要关键词筛选**：基于 title/abstract 的 include/exclude/uncertain 批量预筛，支持 AND/OR 与正则
 - 🧩 **MeSH 校验**：基于 NLM MeSH RDF API 校验主题词，非主题词自动给出官方建议词
 - 📋 **PICOS 工作流**：课题 → PICOS 中英对照 → 双语检索策略 → 初筛/复筛（PRISMA 计数），每步用户确认
-- 📦 **13 种导出格式**：RIS / BibTeX / EndNote XML / PubMed(MEDLINE) / APA / Harvard / MLA / Chicago / IEEE / Vancouver / GB/T 7714 / CSV / XLSX
+- 📦 **13 种导出格式**：RIS / BibTeX / EndNote XML / PubMed(MEDLINE) / APA / Harvard / MLA / Chicago / IEEE / Vancouver / GB/T 7714 / CSV / XLSX（摘要默认导出）
 - 🔗 **智能超链接**：XLSX 中 PMID、DOI、PMC、arXiv、网址列自动挂解析链接
 - 📄 **OA 原文下载**：PMC 开放获取全文（tgz 自动解出 PDF），非 OA 文献仅记录落地页，不绕付费墙
 - 🪶 **零重依赖**：除 XLSX 导出需 `openpyxl` 外，全部功能仅用 Python 标准库
@@ -39,7 +41,16 @@ python scripts/export.py --input results.json --format gbt7714 --out refs.txt
 python scripts/export.py --input results.json --format xlsx \
     --fields title,authors,journal,date,keywords,abstract,doi,url --out papers.xlsx
 
-# 4. 下载开放获取原文
+# 4. 基于摘要关键词批量预筛（示例：纳入含 empagliflozin + cardiovascular death + randomized；排除动物实验）
+python scripts/screen.py --input results.json \
+    --include "empagliflozin,cardiovascular death,randomized" \
+    --exclude "mice,rat,animal,in vitro" \
+    --field title+abstract --mode and --out screening.json
+
+# 5. 从已有题录导入（RIS / BibTeX / MEDLINE），摘要会保留
+python scripts/import.py --input references.ris --format ris --out imported.json
+
+# 6. 下载开放获取原文
 python scripts/download.py --input results.json --ids 35228754,34711976 --outdir papers/
 ```
 
@@ -55,6 +66,8 @@ medlit-search/
 ├── SKILL.md                  # WorkBuddy 技能定义（六步交互流程）
 ├── scripts/
 │   ├── pubmed.py             # PubMed 检索 / 按PMID拉取 / MeSH 校验（纯标准库）
+│   ├── import.py             # RIS/BibTeX/MEDLINE 导入为统一 JSON（保留 abstract）
+│   ├── screen.py             # 基于摘要/标题关键词的初筛/复筛
 │   ├── export.py             # 13 种格式导出器（xlsx 需 openpyxl）
 │   └── download.py           # PMC 开放获取原文下载
 ├── references/

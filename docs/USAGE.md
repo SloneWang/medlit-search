@@ -1,15 +1,17 @@
 # 使用文档 · medlit-search
 
-> 适用版本：v1.0 · 数据源：PubMed（NCBI E-utilities）
+> 适用版本：v1.1 · 数据源：PubMed（NCBI E-utilities）；支持导入 RIS / BibTeX / MEDLINE
 
 ## 目录
 
 1. [安装与前置条件](#1-安装与前置条件)
 2. [pubmed.py：检索 / 拉取 / MeSH 校验](#2-pubmedpy检索--拉取--mesh-校验)
-3. [export.py：13 种格式导出](#3-exportpy13-种格式导出)
-4. [download.py：开放获取原文下载](#4-downloadpy开放获取原文下载)
-5. [完整工作流示例](#5-完整工作流示例)
-6. [FAQ](#6-faq)
+3. [import.py：题录导入（保留 abstract）](#3-importpy题录导入保留-abstract)
+4. [screen.py：基于摘要关键词的初筛/复筛](#4-screenpy基于摘要关键词的初筛复筛)
+5. [export.py：13 种格式导出](#5-exportpy13-种格式导出)
+6. [download.py：开放获取原文下载](#6-downloadpy开放获取原文下载)
+7. [完整工作流示例](#7-完整工作流示例)
+8. [FAQ](#8-faq)
 
 ---
 
@@ -113,7 +115,93 @@ python scripts/pubmed.py mesh --terms-file terms.txt --out mesh_check.json
 
 ---
 
-## 3. export.py：13 种格式导出
+## 3. import.py：题录导入（保留 abstract）
+
+```bash
+python scripts/import.py --input <文件> --format <ris|bibtex|medline> --out results.json
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--input` | 输入文件路径（`.ris` / `.bib` / `.txt` MEDLINE） |
+| `--format` | 强制指定格式；若省略，脚本会按扩展名自动推断 |
+| `--out` | 输出统一 JSON 路径 |
+
+支持字段映射：
+
+| 输入格式 | 标题 | 作者 | 期刊 | 日期 | 摘要 | DOI | PMID |
+|---|---|---|---|---|---|---|---|
+| RIS | TI | AU/A1 | T2/JF/JA | PY/DA/Y1 | AB/N2 | DO | AN |
+| BibTeX | title | author | journal | year/month | abstract | doi | — |
+| MEDLINE | TI | FAU/AU | JT | DP | AB | AID/LID[doi] | PMID |
+
+示例：
+
+```bash
+# 从 Zotero / EndNote / SciSearch 导出的 RIS
+python scripts/import.py --input zotero_export.ris --format ris --out results.json
+
+# 从 Google Scholar / LaTeX 导出的 BibTeX
+python scripts/import.py --input refs.bib --format bibtex --out results.json
+
+# 从 PubMed 按 "Send to -> File -> MEDLINE" 下载的 txt
+python scripts/import.py --input pubmed.txt --format medline --out results.json
+```
+
+导入后的 `results.json` 与 `pubmed.py search` 输出 Schema 完全一致，`abstract` 字段会被完整保留，可直接喂给 `screen.py` / `export.py` / `download.py`。
+
+---
+
+## 4. screen.py：基于摘要关键词的初筛/复筛
+
+```bash
+python scripts/screen.py --input results.json \
+    [--include "词1,词2,..."] [--exclude "词1,词2,..."] \
+    [--field title+abstract|title|abstract] [--mode and|or] \
+    [--regex] [--case-sensitive] [--uncertain-as uncertain|exclude] \
+    --out screening.json
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--include` | 纳入词，逗号分隔；命中即 include（--mode and 要求全中） |
+| `--exclude` | 排除词，逗号分隔；任一命中即 exclude（优先级高于 include） |
+| `--field` | 匹配范围：title+abstract（默认）、title、abstract |
+| `--mode` | 多个 include 词的关系：and（默认，全中）/ or（任一中） |
+| `--regex` | 把每个词当正则表达式匹配 |
+| `--case-sensitive` | 默认忽略大小写；加此参数则区分 |
+| `--uncertain-as` | 未命中纳入也未命中排除的论文标记为 `uncertain`（默认）或 `exclude` |
+| `--out` | 输出 JSON，每篇带 `decision` 字段 |
+
+输出 `screening.json` 的 `papers` 数组中，每篇会追加：
+
+```jsonc
+"decision": {
+  "round1": "include|exclude|uncertain",
+  "reason": "命中纳入词: empagliflozin, cardiovascular death, randomized",
+  "round2": null,
+  "reason2": ""
+}
+```
+
+示例：
+
+```bash
+# 预筛：只要提到 empagliflozin 且出现 cardiovascular death / randomized 的 RCT；排除动物实验
+python scripts/screen.py --input results.json \
+    --include "empagliflozin,cardiovascular death,randomized" \
+    --exclude "mice,rat,animal,in vitro" \
+    --field title+abstract --mode and --out screening.json
+
+# 只看标题是否包含 "systematic review" 或 "meta-analysis"（大小写不敏感）
+python scripts/screen.py --input results.json \
+    --include "systematic review,meta-analysis" \
+    --field title --mode or --out sr_ma.json
+```
+
+---
+
+## 5. export.py：13 种格式导出
 
 ```bash
 python scripts/export.py --input results.json --format <格式> --out <文件> \
@@ -143,7 +231,7 @@ python scripts/export.py --input results.json --format <格式> --out <文件> \
 ### 3.2 电子表格字段（`--fields`）
 
 可选值：`title, authors, journal, date, abstract, keywords, mesh, pub_types, volume, issue, pages, pmid, doi, pmc, arxiv, url`
-默认：`title,authors,journal,date,doi,url`
+默认：`title,authors,journal,date,abstract,doi,url`（摘要默认导出）
 
 - 表头为中文（题目/作者/期刊/发表日期/关键词/摘要/…）。
 - XLSX 中 `pmid / doi / pmc / arxiv` 列自动链接到 PubMed / doi.org / PMC / arXiv；
@@ -161,7 +249,7 @@ python scripts/export.py --input results.json --format csv --exclude 36216487 --
 
 ---
 
-## 4. download.py：开放获取原文下载
+## 6. download.py：开放获取原文下载
 
 ```bash
 python scripts/download.py --input selected.json [--ids ...] --outdir papers/ \
@@ -190,7 +278,7 @@ papers/
 
 ---
 
-## 5. 完整工作流示例
+## 7. 完整工作流示例
 
 课题：*SGLT2 抑制剂对心力衰竭患者心血管结局的影响（RCT）*
 
@@ -210,22 +298,27 @@ python scripts/pubmed.py mesh --terms-file terms.txt --out mesh_check.json
 # ③ 检索：近 5 年，最多 200 篇
 python scripts/pubmed.py search --query-file query.txt --mindate 2021 --retmax 200 --out results.json
 
-# ④ 初筛/复筛（阅读摘要，人工或 AI 完成），把入选 PMID 汇总后刷新元数据
+# ④ 基于摘要关键词批量预筛（示例：保留含 empagliflozin + cardiovascular death + randomized；排除动物实验）
+python scripts/screen.py --input results.json \
+    --include "empagliflozin,cardiovascular death,randomized" \
+    --exclude "mice,rat,animal,in vitro" \
+    --field title+abstract --mode and --out screening.json
+
+# ⑤ 初筛/复筛（阅读摘要，人工或 AI 完成），把入选 PMID 汇总后刷新元数据
 python scripts/pubmed.py fetch --ids 35228754,34711976,36592186 --out selected.json
 
-# ⑤ 导出参考文献与表格
+# ⑥ 导出参考文献与表格（默认已含 abstract）
 python scripts/export.py --input selected.json --format gbt7714 --out refs_gbt.txt
 python scripts/export.py --input selected.json --format ris --out refs.ris
-python scripts/export.py --input selected.json --format xlsx \
-    --fields title,authors,journal,date,abstract,doi,url --out selected.xlsx
+python scripts/export.py --input selected.json --format xlsx --out selected.xlsx
 
-# ⑥ 下载 OA 原文
+# ⑦ 下载 OA 原文
 python scripts/download.py --input selected.json --outdir papers/
 ```
 
 ---
 
-## 6. FAQ
+## 8. FAQ
 
 **Q1：如何申请 NCBI API key？**
 登录 [NCBI 账户](https://www.ncbi.nlm.nih.gov/account/) → Settings → API Key Management。

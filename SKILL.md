@@ -29,10 +29,11 @@ exports/             所有导出产物
 
 ### 第 1 步：接收输入，判断类型
 
-用户输入必为三者之一，先判断再跳转：
+用户输入必为以下之一，先判断再跳转：
 - **课题描述**（自然语言，如"SGLT2 抑制剂对心衰患者预后的影响"）→ 走第 2 步
 - **PICOS 分析**（已按 P/I/C/O/S 结构化）→ 走第 3 步
 - **检索式**（含 [MeSH Terms]/[All Fields]/AND/OR 等 PubMed 语法）→ 走第 4 步
+- **已有题录文件**（RIS / BibTeX / PubMed MEDLINE）→ 走"导入"分支后进入第 5 步
 
 判断有歧义时直接问用户，不要猜。
 
@@ -83,17 +84,38 @@ python scripts/pubmed.py search --query-file query.txt \
 - 完成后报告：命中总数、实际拉取数、字段完整性（缺摘要/缺 DOI 的篇数）。
 - 任何一步用户都可以要求导出（见"导出"节）。
 
+### 导入分支：从已有题录进入工作流
+
+如果用户提供 RIS / BibTeX / PubMed MEDLINE 文件（如从 Zotero / EndNote / SciSearch 导出），
+先用 `import.py` 转成统一 JSON，**摘要会被完整保留**：
+
+```
+python scripts/import.py --input references.ris --format ris --out results.json
+python scripts/import.py --input references.bib --format bibtex --out results.json
+python scripts/import.py --input pubmed_result.txt --format medline --out results.json
+```
+
+导入后继续第 5 步（初筛/复筛）和第 6 步（导出/下载）。
+
 ### 第 5 步：初筛与复筛（基于摘要，对照 PICOS）
 
-**初筛**（我逐篇完成，不需要脚本）：
-1. 读取 results.json，逐篇看 title+abstract 对照 PICOS 五要素。
-2. 每篇给结论：`include`（明确符合）/ `exclude`（明确不符，写排除理由）/
+**初筛**（先跑 `screen.py` 关键词预筛，再逐篇人工/AI 精读）：
+1. 若用户给出明显可程序化的标准，先执行 `screen.py` 做批量预筛（大小写不敏感，支持正则）：
+   ```
+   # 示例：纳入提到 "empagliflozin" 且摘要/标题出现 "cardiovascular death" 的 RCT；排除动物实验
+   python scripts/screen.py --input results.json \
+       --include "empagliflozin,cardiovascular death,randomized" \
+       --exclude "mice,rat,animal,in vitro" \
+       --field title+abstract --mode and --out screening.json
+   ```
+2. 读取 results.json / screening.json，逐篇看 title+abstract 对照 PICOS 五要素。
+3. 每篇给结论：`include`（明确符合）/ `exclude`（明确不符，写排除理由）/
    `uncertain`（摘要信息不足，需全文判定）。
-3. 批量操作时每批 10-20 篇，输出简表（PMID、题录、结论、一句话理由）。
-4. 结果写入 `screening.json`：在 results.json 的每篇 paper 上加
+4. 批量操作时每批 10-20 篇，输出简表（PMID、题录、结论、一句话理由）。
+5. 结果写入 `screening.json`：在 results.json 的每篇 paper 上加
    `"decision": {"round1": "include|exclude|uncertain", "reason": "..."}` 后另存；
    同时写 `screening.md` 供人读（含 PRISMA 式计数：检索 n → 排除 n → 待定 n → 纳入 n）。
-5. 给用户看汇总，**排除清单必须经用户过目**。
+6. 给用户看汇总，**排除清单必须经用户过目**。
 
 **复筛**：按用户追加的标准（如"只留 RCT"、"排除动物实验"、"只要近 5 年"）
 对 include/uncertain 集合再过一遍，决策记入 `decision.round2`。
@@ -127,7 +149,7 @@ python scripts/export.py --input <任意阶段JSON> --format <格式> --out <文
 选项：
 - `--fields`：csv/xlsx 字段，逗号分隔。可选：title, authors, journal, date,
   abstract, keywords, mesh, pub_types, volume, issue, pages, pmid, doi, pmc, arxiv, url。
-  默认 `title,authors,journal,date,doi,url`。
+  默认 `title,authors,journal,date,abstract,doi,url`（摘要默认导出，方便初筛/复筛）。
 - `--ids` / `--exclude`：按 PMID 选/排子集。
 - `--url-source`：网址列取值优先级（auto/doi/pmc/pmid/arxiv，默认 auto = doi>pmc>pmid>arxiv）。
 

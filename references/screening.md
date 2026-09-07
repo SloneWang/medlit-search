@@ -8,6 +8,23 @@
   动物或体外实验 / 非目标语言 / 无摘要且题录明显不相关 / 重复。
 - `uncertain`：摘要信息不足（如只有方案、无明确结局指标），需全文判定。
 
+## 程序化预筛（screen.py）
+
+在人工/AI 精读前，可先用 `scripts/screen.py` 批量过滤明显符合/排除的文献：
+
+```bash
+python scripts/screen.py --input results.json \
+    --include "empagliflozin,cardiovascular death,randomized" \
+    --exclude "mice,rat,animal,in vitro" \
+    --field title+abstract --mode and --out screening.json
+```
+
+- `--field title+abstract`：匹配范围同时覆盖标题与摘要（也可只选 `title` 或 `abstract`）。
+- `--mode and`：多个纳入词必须**全部命中**才 include；`or` 则任一中即可。
+- `--exclude` 优先级最高：任一命中即 exclude。
+- 未命中纳入也未命中排除的论文默认标记 `uncertain`（可用 `--uncertain-as exclude` 改为排除）。
+- 预筛结果仍需人工/AI 按 PICOS 复核；`screening.json` 的 `decision.reason` 会记录命中词。
+
 ## 输出格式（每批 10-20 篇）
 
 | PMID | 题目 | 判定 | 理由 |

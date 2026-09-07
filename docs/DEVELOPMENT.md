@@ -20,15 +20,15 @@
 ## 1. 架构总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ 编排层  SKILL.md（WorkBuddy Skill：六步交互流程定义）      │
-│         PICOS 分析 / 策略生成 / 初筛复筛由 LLM 完成        │
-├─────────────────────────────────────────────────────────┤
-│ 工具层  scripts/pubmed.py   scripts/export.py   scripts/download.py
-│         检索+解析+MeSH校验   13种格式导出        OA全文下载  │
-├─────────────────────────────────────────────────────────┤
-│ 服务层  NCBI E-utilities · NLM MeSH RDF API · PMC OA     │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ 编排层  SKILL.md（WorkBuddy Skill：六步交互流程定义）                 │
+│         PICOS 分析 / 策略生成 / 初筛复筛由 LLM 完成                   │
+├────────────────────────────────────────────────────────────────────┤
+│ 工具层  pubmed.py   import.py   screen.py   export.py   download.py │
+│         检索+解析    题录导入      关键词预筛    13种导出     OA下载   │
+├────────────────────────────────────────────────────────────────────┤
+│ 服务层  NCBI E-utilities · NLM MeSH RDF API · PubMed MEDLINE · PMC OA│
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 设计原则：
@@ -162,6 +162,18 @@ PMID --(idconv API)--> PMCID --(oa.fcgi)--> 下载链接(pdf/tgz) --(候选链)-
 `FIELDS` + `FIELD_LABELS` 各加一行；如需特殊取值逻辑，改 `cell_value`；
 如需超链接，把字段名和 URL 构造函数加进 `ID_URL`。
 
+### 8.4 新增导入格式
+
+1. 在 `import.py` 写 `parse_xxx(text) -> list[dict]`，把字段映射到 Paper Schema；
+2. `main` 的 `--format` choices 增加格式名；
+3. 在 `USAGE.md` 字段映射表和示例中补充新格式。
+
+### 8.5 扩展筛选规则
+
+`screen.py` 当前基于关键词匹配。若需语义相似度、MeSH 词匹配或自定义规则，
+可新增 `--strategy` 子命令：在 `screen_paper` 前加一层策略分发，保持输出
+`decision` Schema 不变。
+
 ## 9. 测试
 
 无单测框架，采用真实 API 冒烟测试（限流内小样本）：
@@ -175,10 +187,20 @@ python scripts/pubmed.py search --query-file q.txt --mindate 2023 --retmax 5 --o
 printf 'Heart Failure\nSGLT2 inhibitors\n' > terms.txt
 python scripts/pubmed.py mesh --terms-file terms.txt --out mesh.json
 
-# 13 种格式全部导出
+# 13 种格式全部导出（xlsx 默认已含 abstract）
 for f in ris bibtex enxml medline apa harvard mla chicago ieee vancouver gbt7714 csv xlsx; do
   python scripts/export.py --input t.json --format $f --out out.$f
 done
+
+# 导入 round-trip：导出 ris -> 再导入 -> abstract 应保留
+python scripts/export.py --input t.json --format ris --out out.ris
+python scripts/import.py --input out.ris --format ris --out imported.json
+python scripts/export.py --input imported.json --format xlsx --out imported.xlsx
+
+# 关键词预筛（应得决策表，abstract/title 含 "empagliflozin" 的标记 include）
+python scripts/screen.py --input t.json \
+    --include "empagliflozin" --exclude "mice,rat" \
+    --field title+abstract --out screening.json
 
 # 下载（PMC8938265 为 OA；应得 tgz + 解出 PDF）
 python scripts/download.py --input t.json --ids 35228754 --outdir papers/
