@@ -17,9 +17,14 @@ screen.py — 基于摘要/标题关键词的文献初筛/复筛脚本
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from export import FIELD_LABELS, cell_value  # type: ignore
 
 
 def load_papers(path: str) -> list[dict]:
@@ -68,6 +73,7 @@ def screen_paper(
     case_sensitive: bool,
 ) -> tuple[str, str]:
     text = get_text(paper, field)
+    title = paper.get("title", "")
 
     # 1. exclude 优先
     for term in excludes:
@@ -101,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reason", default="keyword", choices=["keyword", "picos"],
                     help="理由风格（keyword=命中词；picos=占位，供后续人工补 PICOS 理由）")
     ap.add_argument("--out", required=True, help="输出 JSON 路径（含 decision 字段）")
+    ap.add_argument("--no-csv", action="store_true", help="不生成同名 CSV 审查表")
     args = ap.parse_args(argv)
 
     papers = load_papers(args.input)
@@ -152,9 +159,43 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
+    # 默认生成同名 CSV 审查表，便于人工复核
+    if not args.no_csv:
+        csv_path = os.path.splitext(args.out)[0] + ".csv"
+        _write_screening_csv(screened, csv_path)
+        print(f"[screen] CSV 审查表写入 {csv_path}", file=sys.stderr)
+
     print(f"[screen] 共 {len(papers)} 篇：include={counts['include']}, exclude={counts['exclude']}, uncertain={counts['uncertain']}", file=sys.stderr)
     print(f"[screen] 结果写入 {args.out}", file=sys.stderr)
     return 0
+
+
+_CSV_FIELDS = ["pmid", "title", "authors", "journal", "date", "keywords", "mesh", "abstract", "doi", "url"]
+_EXTRA_FIELDS = ["round1", "reason", "round2", "reason2"]
+
+
+def _decision_text(paper: dict) -> dict[str, str]:
+    decision = paper.get("decision") or {}
+    if isinstance(decision, dict):
+        return {
+            "round1": decision.get("round1", ""),
+            "reason": decision.get("reason", ""),
+            "round2": decision.get("round2") or "",
+            "reason2": decision.get("reason2") or "",
+        }
+    return {"round1": str(decision), "reason": "", "round2": "", "reason2": ""}
+
+
+def _write_screening_csv(papers: list[dict], out: str) -> None:
+    with open(out, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        header = [FIELD_LABELS.get(f, f) for f in _CSV_FIELDS + _EXTRA_FIELDS]
+        w.writerow(header)
+        for p in papers:
+            row = [cell_value(p, f) for f in _CSV_FIELDS]
+            d = _decision_text(p)
+            row.extend([d.get(f, "") for f in _EXTRA_FIELDS])
+            w.writerow(row)
 
 
 if __name__ == "__main__":

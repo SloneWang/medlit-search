@@ -597,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                  "chicago", "ieee", "vancouver", "gbt7714", "csv", "xlsx"],
     )
     ap.add_argument("--out", required=True, help="输出文件路径")
-    ap.add_argument("--fields", default="title,authors,journal,date,abstract,doi,url",
+    ap.add_argument("--fields", default="title,authors,journal,date,keywords,abstract,doi,url",
                     help=f"csv/xlsx 导出字段，逗号分隔。可选：{', '.join(FIELDS)}")
     ap.add_argument("--url-source", default="auto", choices=["auto", "doi", "pmc", "pmid", "arxiv"],
                     help="网址列取值优先级（默认 auto：doi>pmc>pmid>arxiv）")

@@ -9,11 +9,12 @@ description: 医学文献检索与筛选工作流（当前支持 PubMed）。当
 efetch 拉 MEDLINE 文本或 PubMed XML → 解析提取字段 → 限流 3/s（有 NCBI API key 10/s）。
 
 参数语义严格对齐 NCBI E-utilities：
-- `--retmax`：ESearch 单次返回的 UID 数量（分页页大小，默认 200，最大 10000）。
-- `--limit`：用户希望拉取的文献总量（0=全部，默认 0）。
+- `--retmax`：ESearch 单次返回的 UID 数量（分页页大小，默认 20，最大 10000）。
+- `--limit`：用户希望拉取的文献总量（0=全部，默认 0）。命中量大时**务必设置**，否则可能长时间运行。
 - `--batch`：EFetch 单批拉取篇数（建议 ≤200，默认 200）。
 - `--retmode`：EFetch 返回格式，`medline`（默认，保留原始 MEDLINE 文本）或 `xml`（PubMed XML）。
 - `--usehistory`：默认开启，用 ESearch 历史会话（WebEnv/query_key）拉取记录，避免长 URL；可 `--no-usehistory` 退化到 ID 列表模式。
+- `--mindate`/`--maxdate`/`--datetype`：日期过滤；NCBI 要求必须同时提供 mindate 与 maxdate，若只给 mindate，脚本会自动把 maxdate 设为今天。
 
 ## 工作目录约定
 
@@ -79,16 +80,24 @@ exports/             所有导出产物
 询问参数（用户不答则用默认）：
 - **日期范围**：`--mindate`/`--maxdate`（YYYY 或 YYYY/MM/DD）
 - **日期类型**：`--datetype`（默认 `pdat` 发表日期；可选 `edat` Entrez 录入日期、`mdat` MeSH 日期）
-- **ESearch 页大小**：`--retmax`（默认 200，最大 10000）
-- **拉取总量**：`--limit`（默认 0 = 全部；大结果集需提醒耗时）
+
+> ⚠️ **日期过滤必须成对给** —— 只传 `--mindate` 时，NCBI esearch 会**静默忽略整个日期过滤**
+> （返回全年份结果，脚本 metadata 里仍会记 mindate，极具迷惑性）。实测：同一检索式
+> `--mindate 2025/09/01` → 命中 617（含 1992 年记录）；补 `--maxdate 2026/09/09` → 命中 30。
+> **务必同时传 `--maxdate`**，并在拉取后用下列命令抽查年份分布确认生效：
+> `python -c "import json,collections;d=json.load(open('results.json',encoding='utf-8'));print(sorted(collections.Counter((p['date'] or '')[:4] for p in d['papers']).items()))"`
+- **ESearch 页大小**：`--retmax`（默认 20，最大 10000）
+- **拉取总量**：`--limit`（默认 0 = 全部；命中量大时**务必设置**）
 - **EFetch 格式**：`--retmode medline|xml`（默认 `medline`）
 
 执行（检索式必须经文件传入）：
 
 ```
 python scripts/pubmed.py search --query-file query.txt \
-    --mindate 2020 --datetype pdat --retmax 200 --limit 100 --out results.json
+    --mindate 2020 --datetype pdat --retmax 20 --limit 100 --out results.json
 ```
+
+- 未设置 `--limit` 且命中 >200 时，脚本会在 stderr 打印警告，提醒用户设置上限。
 
 - 有 NCBI API key 时加 `--api-key`（或设环境变量 NCBI_API_KEY），速度 3/s→10/s。
 - 完成后报告：命中总数、实际拉取数、字段完整性（缺摘要/缺 DOI 的篇数）。
@@ -125,6 +134,7 @@ python scripts/import.py --input pubmed_result.txt --format medline --out result
 4. 结果写入 `screening.json`：在 results.json 的每篇 paper 上加
    `"decision": {"round1": "include|exclude|uncertain", "reason": "..."}` 后另存；
    同时写 `screening.md` 供人读（含 PRISMA 式计数：检索 n → 排除 n → 待定 n → 纳入 n）。
+   **screen.py 默认还会生成同名 CSV 审查表 `screening.csv`**（含题目、作者、期刊、发表日期、关键词、MeSH、摘要、决策与理由），便于在 Excel 中复核；不需要时用 `--no-csv` 关闭。
 5. 给用户看汇总，**排除清单必须经用户过目**。
 
 **复筛**：按用户追加的标准（如"只留 RCT"、"排除动物实验"、"只要近 5 年"）
@@ -139,10 +149,52 @@ python scripts/pubmed.py fetch --ids <pmid列表> --retmode xml --out selected.j
 python scripts/download.py --input selected.json --outdir papers/
 ```
 
-- 只走合法 OA 渠道：PMC OA Subset（oa.fcgi，含 deprecated 路径兼容）；
+- 只走合法 OA 渠道：PMC OA Subset（oa.fcgi）；
   拿不到 OA 的，manifest.json 记录 DOI/PubMed 落地页，提示用户走机构权限。
 - tgz 包会自动尝试解出内含 PDF。
 - **下载耗时较长时必须用后台任务执行**（10MB/篇级别，前台 shell 会被超时杀掉）。
+
+> ⚠️ **PMC oa.fcgi 端点目前对所有 PMCID 返回 404**（2026-09 实测：连已知 OA 的
+> PMC8279037 也 404），此时 `download.py` 会把**所有文献一律报成 `not_oa`**，
+> 并非真的都不可获取。判断方法：用下面的三行脚本探活——若一个确认 OA 的 PMCID 也 404，
+> 说明是端点失效而非文献状态问题。
+>
+> ```python
+> import urllib.request
+> u="https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC8279037"
+> try: print(urllib.request.urlopen(u,timeout=30).status)
+> except Exception as e: print("ERR",e)   # ERR HTTP Error 404 → 端点失效
+> ```
+>
+> **回退方案（仍属合法 OA 渠道）：Unpaywall**——用 DOI 查 `oa_locations[].url_for_pdf`，
+> 优先取 `host_type == publisher`，下载后校验 `%PDF` 魔数与文件大小 ≥20 KB
+> （PMC 的 `/pmc/articles/PMCxxx/pdf/` 直链常返回约 1.8 KB 的反爬 HTML，会被该校验挡掉）：
+>
+> ```python
+> d=json.loads(urllib.request.urlopen(
+>     "https://api.unpaywall.org/v2/<DOI>?email=<你的邮箱>", timeout=45).read())
+> locs=[x for x in (d.get("oa_locations") or []) if x.get("url_for_pdf")]
+> locs.sort(key=lambda x:(x.get("host_type")!="publisher",x["url_for_pdf"]))
+> # 取 locs[0]["url_for_pdf"] 下载，校验 data[:4]==b"%PDF" 且 len>20000 再落盘
+> ```
+>
+> 无论走哪条路径，**都应在报告里如实写清实际取到几篇全文**，不要把 `not_oa` 当成"均已核对"。
+
+## 批量导出审查 CSV（推荐在筛选完成后使用）
+
+若任务目录下已有 `results.json`、`screening.json`、`selected.json`，可一键生成三份 CSV：
+
+```
+python scripts/workflow.py --dir <任务目录>
+```
+
+输出（均在 `--dir` 目录下）：
+- `all_papers.csv`：检索到的全部文献
+- `screening_round1.csv`：初筛结果（含决策与理由）
+- `selected.csv`：最终纳入文献（优先用 `selected.json`；否则取 screening 中 decision.round1/round2 为 include 的文献）
+
+字段：PMID、题目、作者、期刊、发表日期、关键词、MeSH 主题词、摘要、DOI、网址；
+screening CSV 额外含初筛/复筛决策与理由。
 
 ## 导出（任何步骤随时可用）
 
@@ -159,7 +211,7 @@ python scripts/export.py --input <任意阶段JSON> --format <格式> --out <文
 选项：
 - `--fields`：csv/xlsx 字段，逗号分隔。可选：title, authors, journal, date,
   abstract, keywords, mesh, pub_types, volume, issue, pages, pmid, doi, pmc, arxiv, url。
-  默认 `title,authors,journal,date,abstract,doi,url`（摘要默认导出，方便初筛/复筛）。
+  默认 `title,authors,journal,date,keywords,abstract,doi,url`（摘要、关键词默认导出，方便初筛/复筛）。
 - `--ids` / `--exclude`：按 PMID 选/排子集。
 - `--url-source`：网址列取值优先级（auto/doi/pmc/pmid/arxiv，默认 auto = doi>pmc>pmid>arxiv）。
 

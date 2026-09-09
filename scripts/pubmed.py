@@ -15,11 +15,11 @@ pubmed.py — PubMed (NCBI E-utilities) 检索 / 拉取 / MeSH 校验工具
 仅依赖 Python 标准库。
 
 参数语义（与 NCBI 文档一致）：
-  --retmax  : ESearch 单次返回的 UID 数量（分页页大小），默认 200
-  --limit   : 用户希望拉取的文献总量（0=全部）
+  --retmax  : ESearch 单次返回的 UID 数量（分页页大小），默认 20
+  --limit   : 用户希望拉取的文献总量（0=全部，大结果集务必设置）
   --batch   : EFetch 单批拉取的篇数（<=200，建议 100-200）
   --retmode : EFetch 返回模式，medline 或 xml（默认 medline）
-  --mindate/--maxdate/--datetype : 日期过滤
+  --mindate/--maxdate/--datetype : 日期过滤；仅给 mindate 时 maxdate 默认今天
 
 子命令：
   search  检索并拉取全文级元数据，输出统一 JSON
@@ -32,8 +32,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -514,6 +516,27 @@ def efetch_history(args, query_key: str, webenv: str, retstart: int, retmax: int
 # ---------------------------------------------------------------------------
 
 
+def _today_str() -> str:
+    """返回 NCBI 接受的 YYYY/MM/DD 格式当前日期。"""
+    return time.strftime("%Y/%m/%d")
+
+
+def _normalize_date_arg(d: str) -> str:
+    """把用户输入的 YYYY 或 YYYY/MM/DD 统一为 YYYY/MM/DD（NCBI 接受）。"""
+    d = (d or "").strip()
+    if not d:
+        return ""
+    if re.fullmatch(r"\d{4}", d):
+        return f"{d}/01/01"
+    if re.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", d):
+        return d
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return d.replace("-", "/")
+    if re.fullmatch(r"\d{4}/\d{1,2}", d):
+        return f"{d}/01"
+    return d
+
+
 def cmd_search(args) -> int:
     global _LIMITER
     _LIMITER = RateLimiter(args.api_key)
@@ -525,6 +548,13 @@ def cmd_search(args) -> int:
     retmax = args.retmax  # ESearch 分页页大小
     limit = args.limit    # 用户希望拉取总量，0=全部
     usehistory = getattr(args, "usehistory", True)
+
+    # 日期自动补全：NCBI 仅给 mindate 时会静默忽略过滤，必须同时提供 maxdate
+    args.mindate = _normalize_date_arg(args.mindate)
+    args.maxdate = _normalize_date_arg(args.maxdate)
+    if args.mindate and not args.maxdate:
+        args.maxdate = _today_str()
+        print(f"[search] 只提供 mindate，自动将 maxdate 设为今天 {args.maxdate}", file=sys.stderr)
 
     # 1) ESearch 分页收集 UID
     idlist: list[str] = []
@@ -562,31 +592,111 @@ def cmd_search(args) -> int:
     total_out = min(total, limit) if limit > 0 else total
     print(f"[esearch] 命中 {total} 条，计划拉取 {len(idlist)} 条", file=sys.stderr)
 
-    # 2) EFetch 拉取元数据
-    papers: list[dict] = []
-    retmode = getattr(args, "retmode", "medline")
+    # 大结果集提示
+    if limit == 0 and total > 200:
+        print(
+            f"[warn] 未设置 --limit，将拉取全部 {total} 条。"
+            "如只需样例，请用 --limit 设置上限以节省时间和带宽。",
+            file=sys.stderr,
+        )
 
-    if usehistory and webenv and query_key:
-        # 通过历史会话批量拉取，避免 URL 过长
-        batch = args.batch
-        for start in range(0, len(idlist), batch):
+    # 2) EFetch 拉取元数据（拉取与解析并行）
+    retmode = getattr(args, "retmode", "medline")
+    batch = args.batch
+
+    # 解析函数
+    def parse_chunk(text: str, mode: str) -> list[dict]:
+        if mode == "xml":
+            return parse_pubmed_xml(text)
+        records = parse_medline(text)
+        papers = [record_to_paper(r) for r in records]
+        attach_raw_medline(papers, records)
+        return papers
+
+    # 生产者-消费者队列
+    # item: (text, retmode) 或 None（结束标记）
+    q: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=4)
+    papers: list[dict] = []
+    fetch_errors: list[str] = []
+    done_fetching = threading.Event()
+
+    def consumer() -> None:
+        while True:
+            item = q.get()
+            if item is None:
+                q.task_done()
+                break
+            text, mode = item
             try:
-                chunk_papers, _ = efetch_history(args, query_key, webenv, start, batch)
+                chunk_papers = parse_chunk(text, mode)
                 papers.extend(chunk_papers)
-                print(f"[efetch] {min(start + batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
             except Exception as e:
-                print(f"[efetch] 批次 {start}-{min(start + batch, len(idlist))} 失败，已跳过: {e}", file=sys.stderr)
-    else:
-        # 退化为 ID 列表模式（旧行为，兼容无 usehistory 的场景）
-        efetch_fn = efetch_xml if retmode == "xml" else efetch_medline
-        for i in range(0, len(idlist), args.batch):
-            chunk = idlist[i : i + args.batch]
-            try:
-                chunk_papers, _ = efetch_fn(args, chunk)
-                papers.extend(chunk_papers)
-                print(f"[efetch] {min(i + args.batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
-            except Exception as e:
-                print(f"[efetch] 批次 {i}-{i + len(chunk)} 失败，已跳过: {e}", file=sys.stderr)
+                fetch_errors.append(f"解析失败: {e}")
+            q.task_done()
+
+    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    consumer_thread.start()
+
+    try:
+        if usehistory and webenv and query_key:
+            # 通过历史会话批量拉取；历史会话保存的是完整查询结果，
+            # 因此 retmax 必须用实际剩余数量，否则会取回超出计划的记录。
+            for start in range(0, len(idlist), batch):
+                try:
+                    retmode_param = retmode
+                    this_batch = min(batch, len(idlist) - start)
+                    params: dict[str, str | None] = {
+                        "db": "pubmed",
+                        "query_key": query_key,
+                        "WebEnv": webenv,
+                        "retstart": str(start),
+                        "retmax": str(this_batch),
+                    }
+                    if retmode_param == "xml":
+                        params["retmode"] = "xml"
+                    else:
+                        params["retmode"] = "text"
+                        params["rettype"] = "medline"
+                    params.update(_tool_params(args))
+                    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+                    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
+                    q.put((text, retmode_param))
+                    print(f"[efetch] {min(start + batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
+                except Exception as e:
+                    fetch_errors.append(f"批次 {start}-{min(start + batch, len(idlist))} 拉取失败: {e}")
+        else:
+            # 退化为 ID 列表模式
+            efetch_fn = efetch_xml if retmode == "xml" else efetch_medline
+            for i in range(0, len(idlist), batch):
+                chunk = idlist[i : i + batch]
+                try:
+                    # efetch_fn 返回 tuple；为统一队列，这里手动调用并序列化为文本
+                    if retmode == "xml":
+                        params: dict[str, str | None] = {
+                            "db": "pubmed",
+                            "id": ",".join(chunk),
+                            "retmode": "xml",
+                        }
+                    else:
+                        params = {
+                            "db": "pubmed",
+                            "id": ",".join(chunk),
+                            "retmode": "text",
+                            "rettype": "medline",
+                        }
+                    params.update(_tool_params(args))
+                    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+                    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
+                    q.put((text, retmode))
+                    print(f"[efetch] {min(i + batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
+                except Exception as e:
+                    fetch_errors.append(f"批次 {i}-{i + len(chunk)} 拉取失败: {e}")
+    finally:
+        q.put(None)
+        consumer_thread.join()
+
+    for err in fetch_errors:
+        print(f"[efetch] {err}", file=sys.stderr)
 
     result = {
         "source": "pubmed",
@@ -724,14 +834,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--retmax",
         type=int,
-        default=200,
-        help="ESearch 每批返回 UID 数（分页页大小，默认 200，最大 10000）",
+        default=20,
+        help="ESearch 每批返回 UID 数（分页页大小，默认 20，最大 10000）",
     )
     s.add_argument(
         "--limit",
         type=int,
         default=0,
-        help="最多拉取文献篇数；0=全部（默认）",
+        help="最多拉取文献篇数；0=全部（默认）。命中量大时务必设置，否则可能长时间运行",
     )
     s.add_argument(
         "--batch",
