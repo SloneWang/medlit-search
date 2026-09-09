@@ -21,25 +21,26 @@ import csv
 import json
 import re
 import sys
+from typing import Any, Callable
 from xml.sax.saxutils import escape as xml_escape
 
 # ---------------------------------------------------------------------------
 # 通用工具
 # ---------------------------------------------------------------------------
 
-FIELDS = [
+FIELDS: list[str] = [
     "title", "authors", "journal", "date", "abstract", "keywords", "mesh",
     "pub_types", "volume", "issue", "pages", "pmid", "doi", "pmc", "arxiv", "url",
 ]
 
-FIELD_LABELS = {
+FIELD_LABELS: dict[str, str] = {
     "title": "题目", "authors": "作者", "journal": "期刊", "date": "发表日期",
     "abstract": "摘要", "keywords": "关键词", "mesh": "MeSH主题词",
     "pub_types": "文献类型", "volume": "卷", "issue": "期", "pages": "页码",
     "pmid": "PMID", "doi": "DOI", "pmc": "PMC编号", "arxiv": "arXiv编号", "url": "网址",
 }
 
-ID_URL = {
+ID_URL: dict[str, Callable[[str], str]] = {
     "pmid": lambda v: f"https://pubmed.ncbi.nlm.nih.gov/{v}/",
     "doi": lambda v: f"https://doi.org/{v}",
     "pmc": lambda v: f"https://pmc.ncbi.nlm.nih.gov/articles/{v}/",
@@ -47,7 +48,8 @@ ID_URL = {
 }
 
 
-def load_papers(path: str) -> list[dict]:
+def load_papers(path: str) -> list[dict[str, Any]]:
+    data: list[dict[str, Any]] | dict[str, Any] | Any
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, list):
@@ -58,22 +60,25 @@ def load_papers(path: str) -> list[dict]:
     raise ValueError("输入 JSON 中找不到论文数组（papers/included/results）")
 
 
-def filter_ids(papers: list[dict], ids: str | None, exclude: str | None) -> list[dict]:
+def filter_ids(
+    papers: list[dict[str, Any]], ids: str | None, exclude: str | None
+) -> list[dict[str, Any]]:
     if ids:
-        keep = {x.strip() for x in ids.split(",") if x.strip()}
+        keep: set[str] = {x.strip() for x in ids.split(",") if x.strip()}
         papers = [p for p in papers if str(p.get("pmid", "")) in keep]
     if exclude:
-        drop = {x.strip() for x in exclude.split(",") if x.strip()}
+        drop: set[str] = {x.strip() for x in exclude.split(",") if x.strip()}
         papers = [p for p in papers if str(p.get("pmid", "")) not in drop]
     return papers
 
 
 def expand_pages(pages: str) -> tuple[str, str]:
     """MEDLINE 缩写页码展开：'568-74' -> ('568','574')；无法解析返回原样。"""
-    m = re.match(r"^(\d+)\s*-\s*(\d+)$", pages or "")
+    m: re.Match[str] | None = re.match(r"^(\d+)\s*-\s*(\d+)$", pages or "")
     if not m:
         return pages or "", ""
-    start, end = m.group(1), m.group(2)
+    start: str = m.group(1)
+    end: str = m.group(2)
     if len(end) < len(start):
         end = start[: len(start) - len(end)] + end
     return start, end
@@ -84,7 +89,7 @@ def page_range(pages: str, dash: str = "-") -> str:
     return f"{sp}{dash}{ep}" if ep else sp
 
 
-def year_of(p: dict) -> str:
+def year_of(p: dict[str, Any]) -> str:
     return (p.get("date") or "")[:4]
 
 
@@ -94,7 +99,7 @@ def parse_author(fau: str) -> tuple[str, str]:
     if "," in fau:
         last, given = fau.split(",", 1)
         return last.strip(), given.strip()
-    parts = fau.split()
+    parts: list[str] = fau.split()
     if len(parts) >= 2 and re.fullmatch(r"[A-Z]{1,4}", parts[-1]):
         return " ".join(parts[:-1]), parts[-1]
     return fau, ""
@@ -104,39 +109,44 @@ def initials_of(given: str, dot: bool = True, space: bool = False) -> str:
     """'Adriaan A' -> 'A. A.' / 'AA' / 'A A' 等。连字符名取两段首字母。"""
     if not given:
         return ""
+    letters: list[str]
     if re.fullmatch(r"[A-Z]{1,4}", given):  # 已是缩写
         letters = list(given)
     else:
         letters = []
+        tok: str
         for tok in re.split(r"\s+", given):
             if not tok:
                 continue
-            hy = tok.split("-")
+            hy: list[str] = tok.split("-")
             letters.append("-".join(seg[0].upper() for seg in hy if seg))
-    sep = ". " if (dot and space) else ("." if dot else "")
-    out = sep.join(letters)
+    sep: str = ". " if (dot and space) else ("." if dot else "")
+    out: str = sep.join(letters)
     return out + ("." if dot and out else "")
 
 
-def author_list(p: dict) -> list[tuple[str, str]]:
-    src = p.get("authors") or p.get("authors_abbr") or []
+def author_list(p: dict[str, Any]) -> list[tuple[str, str]]:
+    src: list[str] | Any = p.get("authors") or p.get("authors_abbr") or []
     return [parse_author(a) for a in src]
 
 
-def vancouver_names(p: dict) -> list[str]:
+def vancouver_names(p: dict[str, Any]) -> list[str]:
     """'Voors AA' 风格（姓 + 无点缩写）。"""
-    out = []
+    out: list[str] = []
+    last: str
+    given: str
+    ini: str
     for last, given in author_list(p):
         ini = initials_of(given, dot=False) if given else ""
         out.append(f"{last} {ini}".strip())
     return out
 
 
-def doi_url(p: dict) -> str:
+def doi_url(p: dict[str, Any]) -> str:
     return f"https://doi.org/{p['doi']}" if p.get("doi") else p.get("url", "")
 
 
-def best_url(p: dict, pref: str = "auto") -> str:
+def best_url(p: dict[str, Any], pref: str = "auto") -> str:
     if pref != "auto" and p.get(pref):
         return ID_URL[pref](p[pref])
     for k in ("doi", "pmc", "pmid", "arxiv"):
@@ -150,16 +160,20 @@ def best_url(p: dict, pref: str = "auto") -> str:
 # ---------------------------------------------------------------------------
 
 
-def cite_apa(p: dict) -> str:
-    au = author_list(p)
-    names = [f"{last}, {initials_of(given, dot=True, space=True)}".rstrip(", ") for last, given in au]
+def cite_apa(p: dict[str, Any]) -> str:
+    au: list[tuple[str, str]] = author_list(p)
+    names: list[str] = [
+        f"{last}, {initials_of(given, dot=True, space=True)}".rstrip(", ")
+        for last, given in au
+    ]
+    astr: str
     if len(names) > 20:
         astr = ", ".join(names[:19]) + ", ... " + names[-1]
     elif len(names) > 1:
         astr = ", ".join(names[:-1]) + ", & " + names[-1]
     else:
         astr = names[0] if names else ""
-    bits = f"{astr} ({year_of(p)}). {p.get('title','')} {p.get('journal','')}"
+    bits: str = f"{astr} ({year_of(p)}). {p.get('title','')} {p.get('journal','')}"
     if p.get("volume"):
         bits += f", {p['volume']}"
         if p.get("issue"):
@@ -172,18 +186,22 @@ def cite_apa(p: dict) -> str:
     return bits
 
 
-def cite_harvard(p: dict) -> str:
-    names = []
+def cite_harvard(p: dict[str, Any]) -> str:
+    names: list[str] = []
+    last: str
+    given: str
+    ini: str
     for last, given in author_list(p):
         ini = initials_of(given, dot=True, space=False)
         names.append(f"{last}, {ini}".rstrip(", "))
+    astr: str
     if len(names) > 3:
         astr = names[0] + " et al."
     elif len(names) > 1:
         astr = ", ".join(names[:-1]) + " and " + names[-1]
     else:
         astr = names[0] if names else ""
-    s = f"{astr} ({year_of(p)}) '{p.get('title','').rstrip('.')}', {p.get('journal','')}"
+    s: str = f"{astr} ({year_of(p)}) '{p.get('title','').rstrip('.')}', {p.get('journal','')}"
     if p.get("volume"):
         s += f", {p['volume']}"
         if p.get("issue"):
@@ -196,8 +214,9 @@ def cite_harvard(p: dict) -> str:
     return s
 
 
-def cite_mla(p: dict) -> str:
-    au = author_list(p)
+def cite_mla(p: dict[str, Any]) -> str:
+    au: list[tuple[str, str]] = author_list(p)
+    astr: str
     if not au:
         astr = ""
     elif len(au) == 1:
@@ -206,7 +225,7 @@ def cite_mla(p: dict) -> str:
         astr = f"{au[0][0]}, {au[0][1]}, and {au[1][1]} {au[1][0]}".replace("  ", " ")
     else:
         astr = f"{au[0][0]}, {au[0][1]}, et al".rstrip(", ")
-    s = f'{astr}. "{p.get("title","").rstrip(".")}" {p.get("journal","")}'
+    s: str = f'{astr}. "{p.get("title","").rstrip(".")}" {p.get("journal","")}'
     if p.get("volume"):
         s += f", vol. {p['volume']}"
     if p.get("issue"):
@@ -218,21 +237,22 @@ def cite_mla(p: dict) -> str:
     return s + "."
 
 
-def cite_chicago(p: dict) -> str:
-    au = author_list(p)
+def cite_chicago(p: dict[str, Any]) -> str:
+    au: list[tuple[str, str]] = author_list(p)
+    astr: str
     if not au:
         astr = ""
     else:
-        first = f"{au[0][0]}, {au[0][1]}".rstrip(", ")
-        rest = [f"{g} {l}".strip() for l, g in au[1:]]
-        names = [first] + rest
+        first: str = f"{au[0][0]}, {au[0][1]}".rstrip(", ")
+        rest: list[str] = [f"{g} {l}".strip() for l, g in au[1:]]
+        names: list[str] = [first] + rest
         if len(names) > 10:
             astr = ", ".join(names[:7]) + ", et al."
         elif len(names) > 1:
             astr = ", ".join(names[:-1]) + ", and " + names[-1]
         else:
             astr = names[0]
-    s = f'{astr}. {year_of(p)}. "{p.get("title","").rstrip(".")}" {p.get("journal","")}'
+    s: str = f'{astr}. {year_of(p)}. "{p.get("title","").rstrip(".")}" {p.get("journal","")}'
     if p.get("volume"):
         s += f" {p['volume']}"
         if p.get("issue"):
@@ -245,18 +265,22 @@ def cite_chicago(p: dict) -> str:
     return s
 
 
-def cite_ieee(p: dict) -> str:
-    names = []
+def cite_ieee(p: dict[str, Any]) -> str:
+    names: list[str] = []
+    last: str
+    given: str
+    ini: str
     for last, given in author_list(p):
         ini = initials_of(given, dot=True, space=True)
         names.append(f"{ini} {last}".strip())
+    astr: str
     if len(names) > 6:
         astr = names[0] + " et al."
     elif len(names) > 1:
         astr = ", ".join(names[:-1]) + ", and " + names[-1]
     else:
         astr = names[0] if names else ""
-    s = f'{astr}, "{p.get("title","").rstrip(".")}," {p.get("journal_abbr") or p.get("journal","")}'
+    s: str = f'{astr}, "{p.get("title","").rstrip(".")}," {p.get("journal_abbr") or p.get("journal","")}'
     if p.get("volume"):
         s += f", vol. {p['volume']}"
     if p.get("issue"):
@@ -271,13 +295,14 @@ def cite_ieee(p: dict) -> str:
     return s
 
 
-def cite_vancouver(p: dict) -> str:
-    names = vancouver_names(p)
+def cite_vancouver(p: dict[str, Any]) -> str:
+    names: list[str] = vancouver_names(p)
+    astr: str
     if len(names) > 6:
         astr = ", ".join(names[:6]) + ", et al"
     else:
         astr = ", ".join(names)
-    s = f"{astr.rstrip('.')}. {p.get('title','')} {p.get('journal_abbr') or p.get('journal','')}. {year_of(p)}"
+    s: str = f"{astr.rstrip('.')}. {p.get('title','')} {p.get('journal_abbr') or p.get('journal','')}. {year_of(p)}"
     if p.get("volume"):
         s += f";{p['volume']}"
         if p.get("issue"):
@@ -287,14 +312,15 @@ def cite_vancouver(p: dict) -> str:
     return s + "."
 
 
-def cite_gbt7714(p: dict) -> str:
-    names = vancouver_names(p)
+def cite_gbt7714(p: dict[str, Any]) -> str:
+    names: list[str] = vancouver_names(p)
     # 西文文献：姓全称 + 名缩写（GB/T 7714-2015）；超过 3 位用 et al.
+    astr: str
     if len(names) > 3:
         astr = ", ".join(names[:3]) + ", et al"
     else:
         astr = ", ".join(names)
-    s = f"{astr}. {p.get('title','').rstrip('.')}[J]. {p.get('journal','')}, {year_of(p)}"
+    s: str = f"{astr}. {p.get('title','').rstrip('.')}[J]. {p.get('journal','')}, {year_of(p)}"
     if p.get("volume"):
         s += f", {p['volume']}"
         if p.get("issue"):
@@ -307,7 +333,7 @@ def cite_gbt7714(p: dict) -> str:
     return s
 
 
-CITERS = {
+CITERS: dict[str, tuple[Callable[[dict[str, Any]], str], str]] = {
     "apa": (cite_apa, ""),
     "harvard": (cite_harvard, ""),
     "mla": (cite_mla, ""),
@@ -318,12 +344,16 @@ CITERS = {
 }
 
 
-def write_citations(papers: list[dict], fmt: str, out: str) -> None:
+def write_citations(papers: list[dict[str, Any]], fmt: str, out: str) -> None:
+    fn: Callable[[dict[str, Any]], str]
+    prefix: str
     fn, prefix = CITERS[fmt]
-    lines = []
+    lines: list[str] = []
+    i: int
+    p: dict[str, Any]
     for i, p in enumerate(papers, 1):
         lines.append(prefix.format(n=i) + fn(p))
-    text = "\n\n".join(lines) + "\n"
+    text: str = "\n\n".join(lines) + "\n"
     with open(out, "w", encoding="utf-8") as f:
         f.write(text)
 
@@ -333,12 +363,14 @@ def write_citations(papers: list[dict], fmt: str, out: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def write_ris(papers: list[dict], out: str) -> None:
-    blocks = []
+def write_ris(papers: list[dict[str, Any]], out: str) -> None:
+    blocks: list[str] = []
+    p: dict[str, Any]
     for p in papers:
-        lines = ["TY  - JOUR"]
+        lines: list[str] = ["TY  - JOUR"]
         if p.get("title"):
             lines.append(f"TI  - {p['title']}")
+        a: str
         for a in p.get("authors") or []:
             lines.append(f"AU  - {a}")
         if p.get("journal"):
@@ -351,13 +383,16 @@ def write_ris(papers: list[dict], out: str) -> None:
             lines.append(f"DA  - {p['date'].replace('-', '/')}")
         if p.get("abstract"):
             lines.append(f"AB  - {p['abstract']}")
-        kws = (p.get("keywords") or []) + (p.get("mesh_terms") or [])
+        kws: list[str] = (p.get("keywords") or []) + (p.get("mesh_terms") or [])
+        kw: str
         for kw in kws:
             lines.append(f"KW  - {kw.lstrip('*')}")
         if p.get("volume"):
             lines.append(f"VL  - {p['volume']}")
         if p.get("issue"):
             lines.append(f"IS  - {p['issue']}")
+        sp: str
+        ep: str
         sp, ep = expand_pages(p.get("pages", ""))
         if sp:
             lines.append(f"SP  - {sp}")
@@ -375,22 +410,23 @@ def write_ris(papers: list[dict], out: str) -> None:
         f.write("\n\n".join(blocks) + "\n")
 
 
-_BIB_SPECIAL = re.compile(r"([&%$#_{}])")
+_BIB_SPECIAL: re.Pattern[str] = re.compile(r"[&%$#_{}]")
 
 
 def _bib_escape(s: str) -> str:
     return _BIB_SPECIAL.sub(r"\\\1", s or "")
 
 
-def write_bibtex(papers: list[dict], out: str) -> None:
-    entries = []
+def write_bibtex(papers: list[dict[str, Any]], out: str) -> None:
+    entries: list[str] = []
+    p: dict[str, Any]
     for p in papers:
-        au = author_list(p)
-        first_last = (au[0][0] if au else "anon").lower()
+        au: list[tuple[str, str]] = author_list(p)
+        first_last: str = (au[0][0] if au else "anon").lower()
         first_last = re.sub(r"[^a-z0-9]", "", first_last) or "anon"
-        word = re.sub(r"[^A-Za-z0-9 ]", "", p.get("title", "")).split()
-        key = f"{first_last}{year_of(p)}{word[0].lower() if word else ''}"
-        fields = []
+        word: list[str] = re.sub(r"[^A-Za-z0-9 ]", "", p.get("title", "")).split()
+        key: str = f"{first_last}{year_of(p)}{word[0].lower() if word else ''}"
+        fields: list[tuple[str, str]] = []
         fields.append(("title", _bib_escape(p.get("title", ""))))
         if au:
             fields.append(("author", " and ".join(f"{l}, {g}".rstrip(", ") for l, g in au)))
@@ -408,14 +444,14 @@ def write_bibtex(papers: list[dict], out: str) -> None:
             fields.append(("doi", p["doi"]))
         if p.get("abstract"):
             fields.append(("abstract", _bib_escape(p["abstract"])))
-        kws = (p.get("keywords") or []) + [m.lstrip("*") for m in (p.get("mesh_terms") or [])]
+        kws: list[str] = (p.get("keywords") or []) + [m.lstrip("*") for m in (p.get("mesh_terms") or [])]
         if kws:
             fields.append(("keywords", ", ".join(kws)))
         if p.get("pmid"):
             fields.append(("pmid", p["pmid"]))
         if p.get("url"):
             fields.append(("url", p["url"]))
-        body = ",\n".join(f"  {k} = {{{v}}}" for k, v in fields)
+        body: str = ",\n".join(f"  {k} = {{{v}}}" for k, v in fields)
         entries.append(f"@article{{{key},\n{body}\n}}")
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n\n".join(entries) + "\n")
@@ -425,13 +461,15 @@ def _en_style(text: str) -> str:
     return f'<style face="normal" font="default" size="100%">{xml_escape(text)}</style>'
 
 
-def write_endnote_xml(papers: list[dict], out: str) -> None:
-    recs = []
+def write_endnote_xml(papers: list[dict[str, Any]], out: str) -> None:
+    recs: list[str] = []
+    p: dict[str, Any]
     for p in papers:
-        parts = ['  <record>', '    <ref-type name="Journal Article">17</ref-type>']
-        au = p.get("authors") or []
+        parts: list[str] = ['  <record>', '    <ref-type name="Journal Article">17</ref-type>']
+        au: list[str] = p.get("authors") or []
         if au:
             parts.append("    <contributors><authors>")
+            a: str
             for a in au:
                 parts.append(f"      <author>{_en_style(a)}</author>")
             parts.append("    </authors></contributors>")
@@ -441,7 +479,8 @@ def write_endnote_xml(papers: list[dict], out: str) -> None:
             parts.append(f"    <periodical><full-title>{_en_style(p['journal'])}</full-title></periodical>")
         if p.get("abstract"):
             parts.append(f"    <abstract>{_en_style(p['abstract'])}</abstract>")
-        kws = (p.get("keywords") or []) + [m.lstrip("*") for m in (p.get("mesh_terms") or [])]
+        kws: list[str] = (p.get("keywords") or []) + [m.lstrip("*") for m in (p.get("mesh_terms") or [])]
+        kw: str
         if kws:
             parts.append("    <keywords>")
             for kw in kws:
@@ -468,7 +507,7 @@ def write_endnote_xml(papers: list[dict], out: str) -> None:
             parts.append(f"    <accession-num>{_en_style(p['pmid'])}</accession-num>")
         parts.append("  </record>")
         recs.append("\n".join(parts))
-    doc = (
+    doc: str = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         "<xml>\n<records>\n" + "\n".join(recs) + "\n</records>\n</xml>\n"
     )
@@ -476,14 +515,15 @@ def write_endnote_xml(papers: list[dict], out: str) -> None:
         f.write(doc)
 
 
-def write_medline(papers: list[dict], out: str) -> None:
+def write_medline(papers: list[dict[str, Any]], out: str) -> None:
     """PubMed/MEDLINE 格式：优先输出抓取时保存的原始文本，缺失时按字段重建。"""
-    blocks = []
+    blocks: list[str] = []
+    p: dict[str, Any]
     for p in papers:
         if p.get("_medline"):
             blocks.append(p["_medline"].rstrip())
             continue
-        lines = []
+        lines: list[str] = []
         if p.get("pmid"):
             lines.append(f"PMID- {p['pmid']}")
         if p.get("date"):
@@ -494,6 +534,7 @@ def write_medline(papers: list[dict], out: str) -> None:
             lines.append(f"PG  - {p['pages']}")
         if p.get("abstract"):
             lines.append(f"AB  - {p['abstract']}")
+        a: str
         for a in p.get("authors") or []:
             lines.append(f"FAU - {a}")
         if p.get("journal"):
@@ -504,8 +545,10 @@ def write_medline(papers: list[dict], out: str) -> None:
             lines.append(f"VI  - {p['volume']}")
         if p.get("issue"):
             lines.append(f"IP  - {p['issue']}")
+        m_: str
         for m_ in p.get("mesh_terms") or []:
             lines.append(f"MH  - {m_}")
+        kw: str
         for kw in p.get("keywords") or []:
             lines.append(f"OT  - {kw}")
         if p.get("doi"):
@@ -520,9 +563,9 @@ def write_medline(papers: list[dict], out: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cell_value(p: dict, field: str) -> str:
+def cell_value(p: dict[str, Any], field: str) -> str:
     if field in ("keywords", "mesh", "pub_types"):
-        vals = p.get({"keywords": "keywords", "mesh": "mesh_terms", "pub_types": "pub_types"}[field]) or []
+        vals: list[str] | Any = p.get({"keywords": "keywords", "mesh": "mesh_terms", "pub_types": "pub_types"}[field]) or []
         return "; ".join(v.lstrip("*") for v in vals)
     if field == "authors":
         return "; ".join(p.get("authors") or [])
@@ -531,15 +574,18 @@ def cell_value(p: dict, field: str) -> str:
     return str(p.get(field, "") or "")
 
 
-def write_csv_file(papers: list[dict], fields: list[str], out: str) -> None:
+def write_csv_file(papers: list[dict[str, Any]], fields: list[str], out: str) -> None:
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
+        w: Any = csv.writer(f)
         w.writerow([FIELD_LABELS[f] for f in fields])
+        p: dict[str, Any]
         for p in papers:
             w.writerow([cell_value(p, f) for f in fields])
 
 
-def write_xlsx_file(papers: list[dict], fields: list[str], out: str, url_source: str) -> None:
+def write_xlsx_file(
+    papers: list[dict[str, Any]], fields: list[str], out: str, url_source: str
+) -> None:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font
@@ -551,18 +597,22 @@ def write_xlsx_file(papers: list[dict], fields: list[str], out: str, url_source:
         )
         raise SystemExit(2)
 
-    wb = Workbook()
-    ws = wb.active
+    wb: Any = Workbook()
+    ws: Any = wb.active
     ws.title = "Papers"
-    bold = Font(bold=True)
+    bold: Any = Font(bold=True)
+    c: int
+    f: str
     for c, f in enumerate(fields, 1):
-        cell = ws.cell(row=1, column=c, value=FIELD_LABELS[f])
+        cell: Any = ws.cell(row=1, column=c, value=FIELD_LABELS[f])
         cell.font = bold
+    r: int
+    p: dict[str, Any]
     for r, p in enumerate(papers, 2):
         for c, f in enumerate(fields, 1):
-            val = cell_value(p, f)
+            val: str = cell_value(p, f)
             cell = ws.cell(row=r, column=c, value=val)
-            link = ""
+            link: str = ""
             if f in ID_URL and val:
                 link = ID_URL[f](val)
             elif f == "url":
@@ -573,7 +623,7 @@ def write_xlsx_file(papers: list[dict], fields: list[str], out: str, url_source:
                 cell.style = "Hyperlink"
             if f == "abstract":
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
-    widths = {
+    widths: dict[str, int] = {
         "title": 50, "authors": 35, "journal": 30, "date": 12, "abstract": 80,
         "keywords": 35, "mesh": 40, "pub_types": 25, "volume": 8, "issue": 8,
         "pages": 12, "pmid": 12, "doi": 28, "pmc": 14, "arxiv": 14, "url": 40,
@@ -588,7 +638,9 @@ def write_xlsx_file(papers: list[dict], fields: list[str], out: str, url_source:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="文献导出器（RIS/BibTeX/EndNote/MEDLINE/引用格式/CSV/XLSX）")
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="文献导出器（RIS/BibTeX/EndNote/MEDLINE/引用格式/CSV/XLSX）"
+    )
     ap.add_argument("--input", required=True, help="pubmed.py 产出的 JSON 路径")
     ap.add_argument(
         "--format",
@@ -597,20 +649,27 @@ def main(argv: list[str] | None = None) -> int:
                  "chicago", "ieee", "vancouver", "gbt7714", "csv", "xlsx"],
     )
     ap.add_argument("--out", required=True, help="输出文件路径")
-    ap.add_argument("--fields", default="title,authors,journal,date,keywords,abstract,doi,url",
-                    help=f"csv/xlsx 导出字段，逗号分隔。可选：{', '.join(FIELDS)}")
-    ap.add_argument("--url-source", default="auto", choices=["auto", "doi", "pmc", "pmid", "arxiv"],
-                    help="网址列取值优先级（默认 auto：doi>pmc>pmid>arxiv）")
+    ap.add_argument(
+        "--fields",
+        default="title,authors,journal,date,keywords,abstract,doi,url",
+        help=f"csv/xlsx 导出字段，逗号分隔。可选：{', '.join(FIELDS)}",
+    )
+    ap.add_argument(
+        "--url-source",
+        default="auto",
+        choices=["auto", "doi", "pmc", "pmid", "arxiv"],
+        help="网址列取值优先级（默认 auto：doi>pmc>pmid>arxiv）",
+    )
     ap.add_argument("--ids", default=None, help="只导出这些 PMID（逗号分隔）")
     ap.add_argument("--exclude", default=None, help="排除这些 PMID（逗号分隔）")
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
 
-    papers = filter_ids(load_papers(args.input), args.ids, args.exclude)
+    papers: list[dict[str, Any]] = filter_ids(load_papers(args.input), args.ids, args.exclude)
     if not papers:
         print("[export] 筛选后无论文可导出", file=sys.stderr)
         return 1
 
-    fmt = args.format
+    fmt: str = args.format
     if fmt in CITERS:
         write_citations(papers, fmt, args.out)
     elif fmt == "ris":
@@ -622,8 +681,8 @@ def main(argv: list[str] | None = None) -> int:
     elif fmt == "medline":
         write_medline(papers, args.out)
     elif fmt in ("csv", "xlsx"):
-        fields = [f.strip() for f in args.fields.split(",") if f.strip()]
-        bad = [f for f in fields if f not in FIELDS]
+        fields: list[str] = [f.strip() for f in args.fields.split(",") if f.strip()]
+        bad: list[str] = [f for f in fields if f not in FIELDS]
         if bad:
             print(f"[export] 未知字段: {bad}；可选：{FIELDS}", file=sys.stderr)
             return 2

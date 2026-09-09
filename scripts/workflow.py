@@ -20,31 +20,32 @@ import csv
 import json
 import os
 import sys
-from typing import Any
+from typing import Any, TextIO
 
 # 复用 export.py 的字段标签与取值逻辑
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, FIELDS, cell_value  # type: ignore
 
-_CSV_FIELDS = [
+_CSV_FIELDS: list[str] = [
     "pmid", "title", "authors", "journal", "date",
     "keywords", "mesh", "abstract", "doi", "url",
 ]
 
-_EXTRA_FIELDS = ["round1", "reason", "round2", "reason2"]
+_EXTRA_FIELDS: list[str] = ["round1", "reason", "round2", "reason2"]
 
 
 def _load_json(path: str) -> dict[str, Any] | list[Any] | None:
     if not os.path.exists(path):
         return None
     try:
+        f: TextIO
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
 
-def _extract_papers(data: Any) -> list[dict]:
+def _extract_papers(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -54,9 +55,9 @@ def _extract_papers(data: Any) -> list[dict]:
     return []
 
 
-def _decision_text(paper: dict) -> dict[str, str]:
+def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
     """从 paper['decision'] 提取可读的决策字段。"""
-    decision = paper.get("decision") or {}
+    decision: Any = paper.get("decision") or {}
     if isinstance(decision, dict):
         return {
             "round1": decision.get("round1", ""),
@@ -67,57 +68,59 @@ def _decision_text(paper: dict) -> dict[str, str]:
     return {"round1": str(decision), "reason": "", "round2": "", "reason2": ""}
 
 
-def write_papers_csv(papers: list[dict], out: str, include_decision: bool = False) -> None:
+def write_papers_csv(papers: list[dict[str, Any]], out: str, include_decision: bool = False) -> None:
     """导出统一 paper 列表到 CSV。"""
-    fields = list(_CSV_FIELDS)
+    fields: list[str] = list(_CSV_FIELDS)
     if include_decision:
         fields.extend(_EXTRA_FIELDS)
 
+    f: TextIO
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        header = [FIELD_LABELS.get(f, f) for f in fields]
+        w: Any = csv.writer(f)
+        header: list[str] = [FIELD_LABELS.get(f, f) for f in fields]
         w.writerow(header)
+        p: dict[str, Any]
         for p in papers:
-            row = [cell_value(p, f) for f in _CSV_FIELDS]
+            row: list[str] = [cell_value(p, f) for f in _CSV_FIELDS]
             if include_decision:
-                d = _decision_text(p)
+                d: dict[str, str] = _decision_text(p)
                 row.extend([d.get(f, "") for f in _EXTRA_FIELDS])
             w.writerow(row)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="检索/初筛/复筛结果导出为审查 CSV")
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(description="检索/初筛/复筛结果导出为审查 CSV")
     ap.add_argument("--dir", required=True, help="任务目录路径（含 results.json / screening.json / selected.json）")
     ap.add_argument("--outdir", default=None, help="CSV 输出目录，默认与 --dir 相同")
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
 
-    task_dir = args.dir
-    outdir = args.outdir or task_dir
+    task_dir: str = args.dir
+    outdir: str = args.outdir or task_dir
     os.makedirs(outdir, exist_ok=True)
 
-    results_path = os.path.join(task_dir, "results.json")
-    screening_path = os.path.join(task_dir, "screening.json")
-    selected_path = os.path.join(task_dir, "selected.json")
+    results_path: str = os.path.join(task_dir, "results.json")
+    screening_path: str = os.path.join(task_dir, "screening.json")
+    selected_path: str = os.path.join(task_dir, "selected.json")
 
     # 1) 全部文献
-    results_data = _load_json(results_path)
-    all_papers = _extract_papers(results_data) if results_data else []
+    results_data: dict[str, Any] | list[Any] | None = _load_json(results_path)
+    all_papers: list[dict[str, Any]] = _extract_papers(results_data) if results_data else []
     if all_papers:
-        out_all = os.path.join(outdir, "all_papers.csv")
+        out_all: str = os.path.join(outdir, "all_papers.csv")
         write_papers_csv(all_papers, out_all)
         print(f"[workflow] 全部文献 {len(all_papers)} 篇 -> {out_all}", file=sys.stderr)
 
     # 2) 初筛结果
-    screening_data = _load_json(screening_path)
-    screened_papers = _extract_papers(screening_data) if screening_data else []
+    screening_data: dict[str, Any] | list[Any] | None = _load_json(screening_path)
+    screened_papers: list[dict[str, Any]] = _extract_papers(screening_data) if screening_data else []
     if screened_papers:
-        out_screen = os.path.join(outdir, "screening_round1.csv")
+        out_screen: str = os.path.join(outdir, "screening_round1.csv")
         write_papers_csv(screened_papers, out_screen, include_decision=True)
         print(f"[workflow] 初筛结果 {len(screened_papers)} 篇 -> {out_screen}", file=sys.stderr)
 
     # 3) 最终纳入
-    selected_papers: list[dict] = []
-    selected_data = _load_json(selected_path)
+    selected_papers: list[dict[str, Any]] = []
+    selected_data: dict[str, Any] | list[Any] | None = _load_json(selected_path)
     if selected_data:
         selected_papers = _extract_papers(selected_data)
     elif screened_papers:
@@ -127,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             or (_decision_text(p).get("round1") == "include" and not _decision_text(p).get("round2"))
         ]
     if selected_papers:
-        out_selected = os.path.join(outdir, "selected.csv")
+        out_selected: str = os.path.join(outdir, "selected.csv")
         write_papers_csv(selected_papers, out_selected)
         print(f"[workflow] 最终纳入 {len(selected_papers)} 篇 -> {out_selected}", file=sys.stderr)
 

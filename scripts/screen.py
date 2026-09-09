@@ -22,14 +22,15 @@ import json
 import os
 import re
 import sys
+from typing import Any, Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, cell_value  # type: ignore
 
 
-def load_papers(path: str) -> list[dict]:
+def load_papers(path: str) -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        data: Any = json.load(f)
     if isinstance(data, list):
         return data
     for key in ("papers", "included", "results"):
@@ -44,18 +45,18 @@ def split_terms(text: str | None) -> list[str]:
     return [t.strip() for t in text.split(",") if t.strip()]
 
 
-def build_matcher(term: str, regex: bool, case_sensitive: bool):
-    flags = 0 if case_sensitive else re.IGNORECASE
+def build_matcher(term: str, regex: bool, case_sensitive: bool) -> Callable[[str], bool]:
+    flags: int = 0 if case_sensitive else re.IGNORECASE
     if regex:
-        pattern = re.compile(term, flags)
+        pattern: re.Pattern[str] = re.compile(term, flags)
         return lambda text: bool(pattern.search(text))
     else:
-        target = term if case_sensitive else term.lower()
+        target: str = term if case_sensitive else term.lower()
         return lambda text: target in (text if case_sensitive else text.lower())
 
 
-def get_text(paper: dict, field: str) -> str:
-    parts = []
+def get_text(paper: dict[str, Any], field: str) -> str:
+    parts: list[str] = []
     if field in ("title", "title+abstract"):
         parts.append(paper.get("title", ""))
     if field in ("abstract", "title+abstract"):
@@ -64,7 +65,7 @@ def get_text(paper: dict, field: str) -> str:
 
 
 def screen_paper(
-    paper: dict,
+    paper: dict[str, Any],
     includes: list[str],
     excludes: list[str],
     field: str,
@@ -72,8 +73,8 @@ def screen_paper(
     regex: bool,
     case_sensitive: bool,
 ) -> tuple[str, str]:
-    text = get_text(paper, field)
-    title = paper.get("title", "")
+    text: str = get_text(paper, field)
+    title: str = paper.get("title", "")
 
     # 1. exclude 优先
     for term in excludes:
@@ -82,7 +83,7 @@ def screen_paper(
 
     # 2. include
     if includes:
-        hits = [term for term in includes if build_matcher(term, regex, case_sensitive)(text)]
+        hits: list[str] = [term for term in includes if build_matcher(term, regex, case_sensitive)(text)]
         if mode == "and" and len(hits) == len(includes):
             return "include", f"{field} 命中全部纳入词: {', '.join(hits)}"
         if mode == "or" and hits:
@@ -108,18 +109,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="理由风格（keyword=命中词；picos=占位，供后续人工补 PICOS 理由）")
     ap.add_argument("--out", required=True, help="输出 JSON 路径（含 decision 字段）")
     ap.add_argument("--no-csv", action="store_true", help="不生成同名 CSV 审查表")
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
 
-    papers = load_papers(args.input)
-    includes = split_terms(args.include)
-    excludes = split_terms(args.exclude)
+    papers: list[dict[str, Any]] = load_papers(args.input)
+    includes: list[str] = split_terms(args.include)
+    excludes: list[str] = split_terms(args.exclude)
 
     if not includes and not excludes:
         print("[screen] 必须至少提供 --include 或 --exclude", file=sys.stderr)
         return 2
 
-    counts = {"include": 0, "exclude": 0, "uncertain": 0}
-    screened: list[dict] = []
+    counts: dict[str, int] = {"include": 0, "exclude": 0, "uncertain": 0}
+    screened: list[dict[str, Any]] = []
 
     for p in papers:
         decision, reason = screen_paper(
@@ -129,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             decision = "exclude"
             reason = "未命中纳入词，按 --uncertain-as exclude 排除"
 
-        entry = dict(p)
+        entry: dict[str, Any] = dict(p)
         entry["decision"] = {
             "round1": decision,
             "reason": reason,
@@ -139,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         screened.append(entry)
         counts[decision] += 1
 
-    result = {
+    result: dict[str, Any] = {
         "source": "screen",
         "input": args.input,
         "criteria": {
@@ -161,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 默认生成同名 CSV 审查表，便于人工复核
     if not args.no_csv:
-        csv_path = os.path.splitext(args.out)[0] + ".csv"
+        csv_path: str = os.path.splitext(args.out)[0] + ".csv"
         _write_screening_csv(screened, csv_path)
         print(f"[screen] CSV 审查表写入 {csv_path}", file=sys.stderr)
 
@@ -170,12 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-_CSV_FIELDS = ["pmid", "title", "authors", "journal", "date", "keywords", "mesh", "abstract", "doi", "url"]
-_EXTRA_FIELDS = ["round1", "reason", "round2", "reason2"]
+_CSV_FIELDS: list[str] = ["pmid", "title", "authors", "journal", "date", "keywords", "mesh", "abstract", "doi", "url"]
+_EXTRA_FIELDS: list[str] = ["round1", "reason", "round2", "reason2"]
 
 
-def _decision_text(paper: dict) -> dict[str, str]:
-    decision = paper.get("decision") or {}
+def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
+    decision: Any = paper.get("decision") or {}
     if isinstance(decision, dict):
         return {
             "round1": decision.get("round1", ""),
@@ -186,14 +187,14 @@ def _decision_text(paper: dict) -> dict[str, str]:
     return {"round1": str(decision), "reason": "", "round2": "", "reason2": ""}
 
 
-def _write_screening_csv(papers: list[dict], out: str) -> None:
+def _write_screening_csv(papers: list[dict[str, Any]], out: str) -> None:
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        header = [FIELD_LABELS.get(f, f) for f in _CSV_FIELDS + _EXTRA_FIELDS]
+        w: Any = csv.writer(f)
+        header: list[str] = [FIELD_LABELS.get(f, f) for f in _CSV_FIELDS + _EXTRA_FIELDS]
         w.writerow(header)
         for p in papers:
-            row = [cell_value(p, f) for f in _CSV_FIELDS]
-            d = _decision_text(p)
+            row: list[str] = [cell_value(p, f) for f in _CSV_FIELDS]
+            d: dict[str, str] = _decision_text(p)
             row.extend([d.get(f, "") for f in _EXTRA_FIELDS])
             w.writerow(row)
 

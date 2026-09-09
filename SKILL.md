@@ -16,6 +16,23 @@ efetch 拉 MEDLINE 文本或 PubMed XML → 解析提取字段 → 限流 3/s（
 - `--usehistory`：默认开启，用 ESearch 历史会话（WebEnv/query_key）拉取记录，避免长 URL；可 `--no-usehistory` 退化到 ID 列表模式。
 - `--mindate`/`--maxdate`/`--datetype`：日期过滤；NCBI 要求必须同时提供 mindate 与 maxdate，若只给 mindate，脚本会自动把 maxdate 设为今天。
 
+## 安装（WorkBuddy skill）
+
+本 Skill 托管于 `https://github.com/SloneWang/medlit-search`。\
+**稳定版本请从 `v1.4` 分支安装**，不要直接安装 `main` 分支：
+
+```bash
+# 用户级（推荐）
+git clone -b v1.4 https://github.com/SloneWang/medlit-search.git \
+    ~/.workbuddy/skills/medlit-search
+
+# 项目级
+git clone -b v1.4 https://github.com/SloneWang/medlit-search.git \
+    <你的项目>/.workbuddy/skills/medlit-search
+```
+
+重启 WorkBuddy 会话后即可通过触发词调用。
+
 ## 工作目录约定
 
 每个课题在当前工作区建一个目录：`<工作区>/medlit/<课题slug>/`，结构：

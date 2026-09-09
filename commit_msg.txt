@@ -1,0 +1,6 @@
+feat: 全量类型注解 + v1.4 稳定分支准备
+
+- 为所有 Python 脚本中的常量、全局变量、函数/方法参数、返回值、局部变量、类字段/属性添加 Python 3.10+ 类型注解
+- 涉及的文件：pubmed.py、import.py、screen.py、export.py、download.py、workflow.py
+- 新增 README.md，明确 v1.4 为稳定分支，main 为开发分支
+- 更新 SKILL.md，增加从 v1.4 分支安装的说明

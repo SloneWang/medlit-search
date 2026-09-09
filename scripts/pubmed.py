@@ -41,13 +41,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from typing import Any
 
-EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-MESH_LOOKUP = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
-USER_AGENT = "workbuddy-medlit-skill/1.2 (PubMed literature screening)"
+EUTILS: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+MESH_LOOKUP: str = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
+USER_AGENT: str = "workbuddy-medlit-skill/1.2 (PubMed literature screening)"
 
 # NCBI 建议 EFetch 单批不超过 200 个 UID（URL 过长会失败）
-MAX_EFETCH_BATCH = 200
+MAX_EFETCH_BATCH: int = 200
 
 # ---------------------------------------------------------------------------
 # 限流器（移植 EUtilities.ResetTimer：全局串行计时，每次请求至少间隔 Interval）
@@ -55,13 +56,13 @@ MAX_EFETCH_BATCH = 200
 
 
 class RateLimiter:
-    def __init__(self, api_key: str | None):
-        self.api_key = api_key or os.environ.get("NCBI_API_KEY")
-        self.interval = 1.0 / (10.0 if self.api_key else 3.0)
-        self._next = 0.0
+    def __init__(self, api_key: str | None) -> None:
+        self.api_key: str | None = api_key or os.environ.get("NCBI_API_KEY")
+        self.interval: float = 1.0 / (10.0 if self.api_key else 3.0)
+        self._next: float = 0.0
 
     def wait(self) -> None:
-        now = time.monotonic()
+        now: float = time.monotonic()
         if now < self._next:
             time.sleep(self._next - now)
         self._next = time.monotonic() + self.interval
@@ -82,7 +83,9 @@ def http_get(url: str, timeout: int = 60, retries: int = 4) -> bytes:
     last_err: Exception | None = None
     for attempt in range(retries):
         _limiter().wait()
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        req: urllib.request.Request = urllib.request.Request(
+            url, headers={"User-Agent": USER_AGENT}
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
@@ -98,11 +101,11 @@ def http_get(url: str, timeout: int = 60, retries: int = 4) -> bytes:
     raise RuntimeError(f"请求失败（重试 {retries} 次后仍失败）: {url} -> {last_err}")
 
 
-def _tool_params(args) -> dict[str, str]:
+def _tool_params(args: argparse.Namespace) -> dict[str, str]:
     p: dict[str, str] = {"tool": "workbuddy_medlit"}
     if getattr(args, "email", None):
         p["email"] = args.email
-    api_key = getattr(args, "api_key", None) or os.environ.get("NCBI_API_KEY")
+    api_key: str | None = getattr(args, "api_key", None) or os.environ.get("NCBI_API_KEY")
     if api_key:
         p["api_key"] = api_key
     return p
@@ -110,7 +113,9 @@ def _tool_params(args) -> dict[str, str]:
 
 def _urlencode(params: dict[str, str | None]) -> str:
     """使用 urllib.parse.urlencode，仅保留非空值，空格编码为 +。"""
-    clean = {k: v for k, v in params.items() if v is not None and v != ""}
+    clean: dict[str, str | None] = {
+        k: v for k, v in params.items() if v is not None and v != ""
+    }
     return urllib.parse.urlencode(clean, doseq=False, safe="")
 
 
@@ -129,7 +134,7 @@ def parse_medline(text: str) -> list[list[tuple[str, str]]]:
     """
     norm: list[tuple[str | None, str] | None] = []
     for raw in text.splitlines():
-        line = raw.rstrip("\r\n")
+        line: str = raw.rstrip("\r\n")
         if not line.strip() or len(line) < 6:
             norm.append(None)
         elif line[4] == "-":
@@ -168,12 +173,14 @@ def parse_medline(text: str) -> list[list[tuple[str, str]]]:
     return records
 
 
-_MONTHS = {
+_MONTHS: dict[str, int] = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
-_AID_RE = re.compile(r"^(?P<value>.+?)\s*\[(?P<tag>[A-Za-z -]+)\]\s*$")
+_AID_RE: re.Pattern[str] = re.compile(
+    r"^(?P<value>.+?)\s*\[(?P<tag>[A-Za-z -]+)\]\s*$"
+)
 
 
 def _first(props: list[tuple[str, str]], key: str) -> str:
@@ -190,13 +197,17 @@ def _all(props: list[tuple[str, str]], key: str) -> list[str]:
 def normalize_date(dp: str) -> str:
     """DP 字段 -> 'YYYY-MM-DD' / 'YYYY-MM' / 'YYYY'。例: '2023 May 15'、'2023 May-Jun'。"""
     dp = dp.strip()
-    m = re.match(r"^(\d{4})(?:\s+([A-Za-z]{3,9}))?(?:\s+(\d{1,2}))?", dp)
+    m: re.Match[str] | None = re.match(
+        r"^(\d{4})(?:\s+([A-Za-z]{3,9}))?(?:\s+(\d{1,2}))?", dp
+    )
     if not m:
         return dp
-    year, mon, day = m.group(1), m.group(2), m.group(3)
-    out = year
+    year: str = m.group(1)
+    mon: str | None = m.group(2)
+    day: str | None = m.group(3)
+    out: str = year
     if mon:
-        mk = mon[:3].lower()
+        mk: str = mon[:3].lower()
         if mk in _MONTHS:
             out += f"-{_MONTHS[mk]:02d}"
             if day:
@@ -204,16 +215,16 @@ def normalize_date(dp: str) -> str:
     return out
 
 
-def record_to_paper(props: list[tuple[str, str]]) -> dict:
+def record_to_paper(props: list[tuple[str, str]]) -> dict[str, Any]:
     """NCBIPaperFactory.FromMedline 的扩展移植版。"""
     ids: dict[str, str] = {}
     for k in ("AID", "LID"):
         for v in _all(props, k):
-            m = _AID_RE.match(v)
+            m: re.Match[str] | None = _AID_RE.match(v)
             if not m:
                 continue
-            tag = m.group("tag").strip().lower()
-            val = m.group("value").strip()
+            tag: str = m.group("tag").strip().lower()
+            val: str = m.group("value").strip()
             if tag == "doi":
                 ids.setdefault("doi", val)
             elif tag in ("pmc", "pmcid"):
@@ -222,12 +233,12 @@ def record_to_paper(props: list[tuple[str, str]]) -> dict:
                 ids.setdefault("arxiv", val.removeprefix("arXiv:").strip())
             elif tag == "pii":
                 ids.setdefault("pii", val)
-    pmc_field = _first(props, "PMC")
+    pmc_field: str = _first(props, "PMC")
     if pmc_field and "pmc" not in ids:
         ids["pmc"] = pmc_field if pmc_field.upper().startswith("PMC") else f"PMC{pmc_field}"
 
-    pmid = _first(props, "PMID")
-    paper = {
+    pmid: str = _first(props, "PMID")
+    paper: dict[str, Any] = {
         "pmid": pmid,
         "title": _first(props, "TI"),
         "authors": _all(props, "FAU") or _all(props, "AU"),
@@ -252,7 +263,9 @@ def record_to_paper(props: list[tuple[str, str]]) -> dict:
     return paper
 
 
-def attach_raw_medline(papers: list[dict], records: list[list[tuple[str, str]]]) -> None:
+def attach_raw_medline(
+    papers: list[dict[str, Any]], records: list[list[tuple[str, str]]]
+) -> None:
     """把每条记录的原始 MEDLINE 文本存进 paper['_medline']，供 PubMed 格式无损导出。"""
     for paper, props in zip(papers, records):
         paper["_medline"] = "\n".join(f"{k:<4}- {v}" for k, v in props)
@@ -270,7 +283,7 @@ def _xml_text(el: ET.Element | None, default: str = "") -> str:
 
 
 def _xml_find_text(el: ET.Element, path: str, default: str = "") -> str:
-    child = el.find(path)
+    child: ET.Element | None = el.find(path)
     return _xml_text(child, default)
 
 
@@ -281,11 +294,12 @@ def _xml_findall_text(el: ET.Element, path: str) -> list[str]:
 def _xml_article_ids(article: ET.Element) -> dict[str, str]:
     """从 ArticleIdList / PubmedData 提取 DOI/PMC/PMID/arXiv/PII。"""
     ids: dict[str, str] = {}
-    id_list = article.find("PubmedData/ArticleIdList")
+    id_list: ET.Element | None = article.find("PubmedData/ArticleIdList")
     if id_list is not None:
+        aid: ET.Element
         for aid in id_list.findall("ArticleId"):
-            id_type = (aid.get("IdType") or "").lower()
-            val = _xml_text(aid)
+            id_type: str = (aid.get("IdType") or "").lower()
+            val: str = _xml_text(aid)
             if id_type == "doi":
                 ids.setdefault("doi", val)
             elif id_type in ("pmc", "pmcid"):
@@ -302,32 +316,34 @@ def _xml_article_ids(article: ET.Element) -> dict[str, str]:
 def _xml_authors(article: ET.Element) -> list[str]:
     """优先返回完整姓名 'LastName ForeName'；否则 'CollectiveName' 或缩写。"""
     authors: list[str] = []
-    auth_list = article.find("MedlineCitation/Article/AuthorList")
+    auth_list: ET.Element | None = article.find("MedlineCitation/Article/AuthorList")
     if auth_list is None:
         return authors
+    author: ET.Element
     for author in auth_list.findall("Author"):
-        last = _xml_text(author.find("LastName"))
-        fore = _xml_text(author.find("ForeName"))
-        collective = _xml_text(author.find("CollectiveName"))
+        last: str = _xml_text(author.find("LastName"))
+        fore: str = _xml_text(author.find("ForeName"))
+        collective: str = _xml_text(author.find("CollectiveName"))
         if collective:
             authors.append(collective)
         elif last and fore:
             authors.append(f"{last} {fore}")
         elif last:
-            initials = _xml_text(author.find("Initials"))
+            initials: str = _xml_text(author.find("Initials"))
             authors.append(f"{last} {initials}".strip())
     return authors
 
 
 def _xml_abstract(article: ET.Element) -> str:
     """拼接 Abstract/AbstractText；带 Label 时保留结构。"""
-    abstract_el = article.find("MedlineCitation/Article/Abstract")
+    abstract_el: ET.Element | None = article.find("MedlineCitation/Article/Abstract")
     if abstract_el is None:
         return ""
     parts: list[str] = []
+    at: ET.Element
     for at in abstract_el.findall("AbstractText"):
-        label = at.get("Label", "")
-        text = _xml_text(at)
+        label: str = at.get("Label", "")
+        text: str = _xml_text(at)
         if label:
             parts.append(f"{label}: {text}")
         else:
@@ -337,16 +353,19 @@ def _xml_abstract(article: ET.Element) -> str:
 
 def _xml_date(article: ET.Element) -> str:
     """优先用 ArticleDate，其次 JournalIssue/PubDate。"""
-    # PubMed 推荐日期：PubMedPubDate/status=pubmed 或 ArticleDate
-    pub_date = article.find("MedlineCitation/Article/ArticleDate")
+    pub_date: ET.Element | None = article.find("MedlineCitation/Article/ArticleDate")
     if pub_date is not None:
-        y = _xml_text(pub_date.find("Year"))
-        m = _xml_text(pub_date.find("Month"))
-        d = _xml_text(pub_date.find("Day"))
+        y: str = _xml_text(pub_date.find("Year"))
+        m: str = _xml_text(pub_date.find("Month"))
+        d: str = _xml_text(pub_date.find("Day"))
         if y:
-            out = y
+            out: str = y
             if m:
-                out += f"-{_MONTHS[m[:3].lower()]:02d}" if m[:3].lower() in _MONTHS else f"-{m}"
+                out += (
+                    f"-{_MONTHS[m[:3].lower()]:02d}"
+                    if m[:3].lower() in _MONTHS
+                    else f"-{m}"
+                )
             if d and m:
                 out += f"-{int(d):02d}"
             return out
@@ -357,14 +376,14 @@ def _xml_date(article: ET.Element) -> str:
     y = _xml_text(pub_date.find("Year"))
     m = _xml_text(pub_date.find("Month"))
     d = _xml_text(pub_date.find("Day"))
-    medline_date = _xml_text(pub_date.find("MedlineDate"))
+    medline_date: str = _xml_text(pub_date.find("MedlineDate"))
     if medline_date:
         return normalize_date(medline_date)
     if not y:
         return ""
     out = y
     if m:
-        mk = m[:3].lower()
+        mk: str = m[:3].lower()
         if mk in _MONTHS:
             out += f"-{_MONTHS[mk]:02d}"
             if d:
@@ -374,35 +393,39 @@ def _xml_date(article: ET.Element) -> str:
     return out
 
 
-def parse_pubmed_xml(text: str) -> list[dict]:
+def parse_pubmed_xml(text: str) -> list[dict[str, Any]]:
     """解析 EFetch 返回的 PubMed XML（PubmedArticleSet），输出统一 paper dict 列表。"""
-    root = ET.fromstring(text)
-    papers: list[dict] = []
+    root: ET.Element = ET.fromstring(text)
+    papers: list[dict[str, Any]] = []
+    article: ET.Element
     for article in root.findall("PubmedArticle"):
-        ids = _xml_article_ids(article)
-        pmid = ids.get("pmid") or _xml_find_text(article, "MedlineCitation/PMID")
-        article_el = article.find("MedlineCitation/Article")
+        ids: dict[str, str] = _xml_article_ids(article)
+        pmid: str = ids.get("pmid") or _xml_find_text(article, "MedlineCitation/PMID")
+        article_el: ET.Element | None = article.find("MedlineCitation/Article")
         if article_el is None:
             continue
 
         mesh_terms: list[str] = []
-        mh_list = article.find("MedlineCitation/MeshHeadingList")
+        mh_list: ET.Element | None = article.find("MedlineCitation/MeshHeadingList")
         if mh_list is not None:
+            mh: ET.Element
             for mh in mh_list.findall("MeshHeading"):
-                desc = _xml_find_text(mh, "DescriptorName")
-                qual = _xml_find_text(mh, "QualifierName")
+                desc: str = _xml_find_text(mh, "DescriptorName")
+                qual: str = _xml_find_text(mh, "QualifierName")
                 if desc:
                     mesh_terms.append(f"{desc} / {qual}" if qual else desc)
 
         keywords: list[str] = []
-        kw_list = article.find("MedlineCitation/KeywordList")
+        kw_list: ET.Element | None = article.find("MedlineCitation/KeywordList")
         if kw_list is not None:
             keywords = _xml_findall_text(kw_list, "Keyword")
 
-        pub_types: list[str] = _xml_findall_text(article_el, "PublicationTypeList/PublicationType")
-        language = _xml_find_text(article_el, "Language")
+        pub_types: list[str] = _xml_findall_text(
+            article_el, "PublicationTypeList/PublicationType"
+        )
+        language: str = _xml_find_text(article_el, "Language")
 
-        paper = {
+        paper: dict[str, Any] = {
             "pmid": pmid,
             "title": _xml_find_text(article_el, "ArticleTitle"),
             "authors": _xml_authors(article),
@@ -433,7 +456,13 @@ def parse_pubmed_xml(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def esearch(args, query: str, retstart: int, retmax: int, usehistory: bool = True) -> dict:
+def esearch(
+    args: argparse.Namespace,
+    query: str,
+    retstart: int,
+    retmax: int,
+    usehistory: bool = True,
+) -> dict[str, Any]:
     """调用 esearch.fcgi；返回 esearchresult（含 count/idlist，可选 webenv/querykey）。"""
     params: dict[str, str | None] = {
         "db": "pubmed",
@@ -452,12 +481,14 @@ def esearch(args, query: str, retstart: int, retmax: int, usehistory: bool = Tru
     if getattr(args, "datetype", None):
         params["datetype"] = args.datetype
     params.update(_tool_params(args))
-    url = f"{EUTILS}/esearch.fcgi?{_urlencode(params)}"
-    data = json.loads(http_get(url).decode("utf-8"))
+    url: str = f"{EUTILS}/esearch.fcgi?{_urlencode(params)}"
+    data: dict[str, Any] = json.loads(http_get(url).decode("utf-8"))
     return data.get("esearchresult", {})
 
 
-def efetch_medline(args, pmids: list[str]) -> tuple[list[dict], list[list[tuple[str, str]]]]:
+def efetch_medline(
+    args: argparse.Namespace, pmids: list[str]
+) -> tuple[list[dict[str, Any]], list[list[tuple[str, str]]]]:
     params: dict[str, str | None] = {
         "db": "pubmed",
         "id": ",".join(pmids),
@@ -465,29 +496,35 @@ def efetch_medline(args, pmids: list[str]) -> tuple[list[dict], list[list[tuple[
         "rettype": "medline",
     }
     params.update(_tool_params(args))
-    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
-    records = parse_medline(text)
-    papers = [record_to_paper(r) for r in records]
+    url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+    text: str = http_get(url, timeout=120).decode("utf-8", errors="replace")
+    records: list[list[tuple[str, str]]] = parse_medline(text)
+    papers: list[dict[str, Any]] = [record_to_paper(r) for r in records]
     attach_raw_medline(papers, records)
     return papers, records
 
 
-def efetch_xml(args, pmids: list[str]) -> list[dict]:
+def efetch_xml(args: argparse.Namespace, pmids: list[str]) -> list[dict[str, Any]]:
     params: dict[str, str | None] = {
         "db": "pubmed",
         "id": ",".join(pmids),
         "retmode": "xml",
     }
     params.update(_tool_params(args))
-    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
+    url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+    text: str = http_get(url, timeout=120).decode("utf-8", errors="replace")
     return parse_pubmed_xml(text)
 
 
-def efetch_history(args, query_key: str, webenv: str, retstart: int, retmax: int) -> tuple[list[dict], list[list[tuple[str, str]]] | None]:
+def efetch_history(
+    args: argparse.Namespace,
+    query_key: str,
+    webenv: str,
+    retstart: int,
+    retmax: int,
+) -> tuple[list[dict[str, Any]], list[list[tuple[str, str]]] | None]:
     """通过 ESearch 历史会话拉取；仅支持 XML 或 MEDLINE。"""
-    retmode = getattr(args, "retmode", "medline")
+    retmode: str = getattr(args, "retmode", "medline")
     params: dict[str, str | None] = {
         "db": "pubmed",
         "query_key": query_key,
@@ -501,12 +538,12 @@ def efetch_history(args, query_key: str, webenv: str, retstart: int, retmax: int
         params["retmode"] = "text"
         params["rettype"] = "medline"
     params.update(_tool_params(args))
-    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
+    url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+    text: str = http_get(url, timeout=120).decode("utf-8", errors="replace")
     if retmode == "xml":
         return parse_pubmed_xml(text), None
-    records = parse_medline(text)
-    papers = [record_to_paper(r) for r in records]
+    records: list[list[tuple[str, str]]] = parse_medline(text)
+    papers: list[dict[str, Any]] = [record_to_paper(r) for r in records]
     attach_raw_medline(papers, records)
     return papers, records
 
@@ -537,34 +574,37 @@ def _normalize_date_arg(d: str) -> str:
     return d
 
 
-def cmd_search(args) -> int:
+def cmd_search(args: argparse.Namespace) -> int:
     global _LIMITER
     _LIMITER = RateLimiter(args.api_key)
     if getattr(args, "query_file", None):
         with open(args.query_file, "r", encoding="utf-8") as f:
             args.query = f.read().strip()
 
-    query = args.query
-    retmax = args.retmax  # ESearch 分页页大小
-    limit = args.limit    # 用户希望拉取总量，0=全部
-    usehistory = getattr(args, "usehistory", True)
+    query: str = args.query
+    retmax: int = args.retmax  # ESearch 分页页大小
+    limit: int = args.limit    # 用户希望拉取总量，0=全部
+    usehistory: bool = getattr(args, "usehistory", True)
 
     # 日期自动补全：NCBI 仅给 mindate 时会静默忽略过滤，必须同时提供 maxdate
     args.mindate = _normalize_date_arg(args.mindate)
     args.maxdate = _normalize_date_arg(args.maxdate)
     if args.mindate and not args.maxdate:
         args.maxdate = _today_str()
-        print(f"[search] 只提供 mindate，自动将 maxdate 设为今天 {args.maxdate}", file=sys.stderr)
+        print(
+            f"[search] 只提供 mindate，自动将 maxdate 设为今天 {args.maxdate}",
+            file=sys.stderr,
+        )
 
     # 1) ESearch 分页收集 UID
     idlist: list[str] = []
-    total = 0
-    webenv = ""
-    query_key = ""
-    retstart = 0
+    total: int = 0
+    webenv: str = ""
+    query_key: str = ""
+    retstart: int = 0
     while True:
         # 若用户设了 limit，控制 ESearch 返回总量
-        remaining = None
+        remaining: int | None = None
         if limit > 0:
             remaining = limit - len(idlist)
             if remaining <= 0:
@@ -572,10 +612,10 @@ def cmd_search(args) -> int:
             if retmax > remaining:
                 retmax = remaining
 
-        res = esearch(args, query, retstart, retmax, usehistory=usehistory)
+        res: dict[str, Any] = esearch(args, query, retstart, retmax, usehistory=usehistory)
         total = int(res.get("count", "0"))
-        ids = res.get("idlist", [])
-        returned = int(res.get("retmax", len(ids)))
+        ids: list[str] = res.get("idlist", [])
+        returned: int = int(res.get("retmax", len(ids)))
         if not webenv and res.get("webenv"):
             webenv = res["webenv"]
         if not query_key and res.get("querykey"):
@@ -589,7 +629,7 @@ def cmd_search(args) -> int:
             break
         retstart += returned
 
-    total_out = min(total, limit) if limit > 0 else total
+    total_out: int = min(total, limit) if limit > 0 else total
     print(f"[esearch] 命中 {total} 条，计划拉取 {len(idlist)} 条", file=sys.stderr)
 
     # 大结果集提示
@@ -601,50 +641,50 @@ def cmd_search(args) -> int:
         )
 
     # 2) EFetch 拉取元数据（拉取与解析并行）
-    retmode = getattr(args, "retmode", "medline")
-    batch = args.batch
+    retmode: str = getattr(args, "retmode", "medline")
+    batch: int = args.batch
 
     # 解析函数
-    def parse_chunk(text: str, mode: str) -> list[dict]:
+    def parse_chunk(text: str, mode: str) -> list[dict[str, Any]]:
         if mode == "xml":
             return parse_pubmed_xml(text)
-        records = parse_medline(text)
-        papers = [record_to_paper(r) for r in records]
+        records: list[list[tuple[str, str]]] = parse_medline(text)
+        papers: list[dict[str, Any]] = [record_to_paper(r) for r in records]
         attach_raw_medline(papers, records)
         return papers
 
     # 生产者-消费者队列
     # item: (text, retmode) 或 None（结束标记）
     q: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=4)
-    papers: list[dict] = []
+    papers: list[dict[str, Any]] = []
     fetch_errors: list[str] = []
-    done_fetching = threading.Event()
 
     def consumer() -> None:
         while True:
-            item = q.get()
+            item: tuple[str, str] | None = q.get()
             if item is None:
                 q.task_done()
                 break
             text, mode = item
             try:
-                chunk_papers = parse_chunk(text, mode)
+                chunk_papers: list[dict[str, Any]] = parse_chunk(text, mode)
                 papers.extend(chunk_papers)
             except Exception as e:
                 fetch_errors.append(f"解析失败: {e}")
             q.task_done()
 
-    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    consumer_thread: threading.Thread = threading.Thread(target=consumer, daemon=True)
     consumer_thread.start()
 
     try:
         if usehistory and webenv and query_key:
             # 通过历史会话批量拉取；历史会话保存的是完整查询结果，
             # 因此 retmax 必须用实际剩余数量，否则会取回超出计划的记录。
+            start: int
             for start in range(0, len(idlist), batch):
                 try:
-                    retmode_param = retmode
-                    this_batch = min(batch, len(idlist) - start)
+                    retmode_param: str = retmode
+                    this_batch: int = min(batch, len(idlist) - start)
                     params: dict[str, str | None] = {
                         "db": "pubmed",
                         "query_key": query_key,
@@ -658,21 +698,27 @@ def cmd_search(args) -> int:
                         params["retmode"] = "text"
                         params["rettype"] = "medline"
                     params.update(_tool_params(args))
-                    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-                    text = http_get(url, timeout=120).decode("utf-8", errors="replace")
+                    url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+                    text: str = http_get(url, timeout=120).decode("utf-8", errors="replace")
                     q.put((text, retmode_param))
-                    print(f"[efetch] {min(start + batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
+                    print(
+                        f"[efetch] {min(start + batch, len(idlist))}/{len(idlist)}",
+                        file=sys.stderr,
+                    )
                 except Exception as e:
-                    fetch_errors.append(f"批次 {start}-{min(start + batch, len(idlist))} 拉取失败: {e}")
+                    fetch_errors.append(
+                        f"批次 {start}-{min(start + batch, len(idlist))} 拉取失败: {e}"
+                    )
         else:
             # 退化为 ID 列表模式
-            efetch_fn = efetch_xml if retmode == "xml" else efetch_medline
+            i: int
             for i in range(0, len(idlist), batch):
-                chunk = idlist[i : i + batch]
+                chunk: list[str] = idlist[i : i + batch]
                 try:
-                    # efetch_fn 返回 tuple；为统一队列，这里手动调用并序列化为文本
+                    # 为统一队列，这里手动构造请求并序列化为文本
+                    params: dict[str, str | None]
                     if retmode == "xml":
-                        params: dict[str, str | None] = {
+                        params = {
                             "db": "pubmed",
                             "id": ",".join(chunk),
                             "retmode": "xml",
@@ -688,7 +734,10 @@ def cmd_search(args) -> int:
                     url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
                     text = http_get(url, timeout=120).decode("utf-8", errors="replace")
                     q.put((text, retmode))
-                    print(f"[efetch] {min(i + batch, len(idlist))}/{len(idlist)}", file=sys.stderr)
+                    print(
+                        f"[efetch] {min(i + batch, len(idlist))}/{len(idlist)}",
+                        file=sys.stderr,
+                    )
                 except Exception as e:
                     fetch_errors.append(f"批次 {i}-{i + len(chunk)} 拉取失败: {e}")
     finally:
@@ -698,7 +747,7 @@ def cmd_search(args) -> int:
     for err in fetch_errors:
         print(f"[efetch] {err}", file=sys.stderr)
 
-    result = {
+    result: dict[str, Any] = {
         "source": "pubmed",
         "query": query,
         "mindate": args.mindate or "",
@@ -713,19 +762,24 @@ def cmd_search(args) -> int:
     return 0
 
 
-def cmd_fetch(args) -> int:
+def cmd_fetch(args: argparse.Namespace) -> int:
     global _LIMITER
     _LIMITER = RateLimiter(args.api_key)
-    pmids = [p.strip() for p in args.ids.split(",") if p.strip()]
-    papers: list[dict] = []
-    retmode = getattr(args, "retmode", "medline")
+    pmids: list[str] = [p.strip() for p in args.ids.split(",") if p.strip()]
+    papers: list[dict[str, Any]] = []
+    retmode: str = getattr(args, "retmode", "medline")
     efetch_fn = efetch_xml if retmode == "xml" else efetch_medline
+    i: int
     for i in range(0, len(pmids), args.batch):
-        chunk = pmids[i : i + args.batch]
+        chunk: list[str] = pmids[i : i + args.batch]
+        chunk_papers: list[dict[str, Any]]
         chunk_papers, _ = efetch_fn(args, chunk)
         papers.extend(chunk_papers)
-        print(f"[efetch] {min(i + args.batch, len(pmids))}/{len(pmids)}", file=sys.stderr)
-    result = {
+        print(
+            f"[efetch] {min(i + args.batch, len(pmids))}/{len(pmids)}",
+            file=sys.stderr,
+        )
+    result: dict[str, Any] = {
         "source": "pubmed",
         "query": f"ids:{args.ids}",
         "search_date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -743,10 +797,10 @@ def cmd_fetch(args) -> int:
 
 
 def _mesh_descriptor_label(descriptor_id: str) -> str:
-    url = f"https://id.nlm.nih.gov/mesh/{descriptor_id}.json"
+    url: str = f"https://id.nlm.nih.gov/mesh/{descriptor_id}.json"
     try:
-        data = json.loads(http_get(url).decode("utf-8"))
-        label = data.get("label", {})
+        data: dict[str, Any] = json.loads(http_get(url).decode("utf-8"))
+        label: Any = data.get("label", {})
         if isinstance(label, dict):
             return label.get("@value", "")
         return str(label)
@@ -755,41 +809,51 @@ def _mesh_descriptor_label(descriptor_id: str) -> str:
 
 
 def mesh_lookup(term: str, match: str) -> list[str]:
-    url = f"{MESH_LOOKUP}?{_urlencode({'label': term, 'match': match, 'limit': '10'})}"
-    data = json.loads(http_get(url).decode("utf-8"))
-    out = []
+    url: str = (
+        f"{MESH_LOOKUP}?{_urlencode({'label': term, 'match': match, 'limit': '10'})}"
+    )
+    data: Any = json.loads(http_get(url).decode("utf-8"))
+    out: list[str] = []
+    uri: Any
     for uri in data if isinstance(data, list) else []:
-        m = re.search(r"/mesh/(D\d+|C\d+)", str(uri))
+        m: re.Match[str] | None = re.search(r"/mesh/(D\d+|C\d+)", str(uri))
         if m:
             out.append(m.group(1))
     return out
 
 
-def cmd_mesh(args) -> int:
+def cmd_mesh(args: argparse.Namespace) -> int:
     global _LIMITER
     _LIMITER = RateLimiter(args.api_key)
-    terms = list(args.terms or [])
+    terms: list[str] = list(args.terms or [])
     if getattr(args, "terms_file", None):
         with open(args.terms_file, "r", encoding="utf-8") as f:
             terms.extend(ln.strip() for ln in f if ln.strip())
     if not terms:
         print("[mesh] 未提供任何术语", file=sys.stderr)
         return 1
-    results = []
+    results: list[dict[str, Any]] = []
     for term in terms:
-        entry: dict = {"term": term, "status": "not_found", "descriptor_id": "", "label": "", "suggestions": []}
+        entry: dict[str, Any] = {
+            "term": term,
+            "status": "not_found",
+            "descriptor_id": "",
+            "label": "",
+            "suggestions": [],
+        }
         try:
-            hits = mesh_lookup(term, "exact")
+            hits: list[str] = mesh_lookup(term, "exact")
             if hits:
                 entry["status"] = "exact"
                 entry["descriptor_id"] = hits[0]
                 entry["label"] = _mesh_descriptor_label(hits[0])
             else:
-                sugg = mesh_lookup(term, "contains")[:5]
+                sugg: list[str] = mesh_lookup(term, "contains")[:5]
                 if sugg:
                     entry["status"] = "suggest"
                     entry["suggestions"] = [
-                        {"descriptor_id": s, "label": _mesh_descriptor_label(s)} for s in sugg
+                        {"descriptor_id": s, "label": _mesh_descriptor_label(s)}
+                        for s in sugg
                     ]
         except Exception as e:
             entry["status"] = "error"
@@ -803,8 +867,8 @@ def cmd_mesh(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _dump(obj: dict, out: str) -> None:
-    text = json.dumps(obj, ensure_ascii=False, indent=2)
+def _dump(obj: dict[str, Any], out: str) -> None:
+    text: str = json.dumps(obj, ensure_ascii=False, indent=2)
     if out == "-" or not out:
         sys.stdout.write(text + "\n")
     else:
@@ -814,13 +878,17 @@ def _dump(obj: dict, out: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="PubMed 检索 / 拉取 / MeSH 校验")
-    ap.add_argument("--api-key", default=None, help="NCBI API key（或设环境变量 NCBI_API_KEY）")
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="PubMed 检索 / 拉取 / MeSH 校验"
+    )
+    ap.add_argument(
+        "--api-key", default=None, help="NCBI API key（或设环境变量 NCBI_API_KEY）"
+    )
     ap.add_argument("--email", default=None, help="联系邮箱（NCBI 建议提供）")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub: argparse._SubParsersAction = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("search", help="检索 PubMed 并拉取元数据")
-    q = s.add_mutually_exclusive_group(required=True)
+    s: argparse.ArgumentParser = sub.add_parser("search", help="检索 PubMed 并拉取元数据")
+    q: argparse._MutuallyExclusiveGroup = s.add_mutually_exclusive_group(required=True)
     q.add_argument("--query", help="PubMed 检索式（英文）")
     q.add_argument("--query-file", help="从 UTF-8 文本文件读取检索式（避免 shell 引号问题）")
     s.add_argument("--mindate", default="", help="起始日期 YYYY/MM/DD 或 YYYY")
@@ -861,11 +929,13 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="使用 ESearch 历史服务器拉取记录（默认开启）",
     )
-    s.add_argument("--sort", default="relevance", choices=["relevance", "pub_date", ""], help="排序")
+    s.add_argument(
+        "--sort", default="relevance", choices=["relevance", "pub_date", ""], help="排序"
+    )
     s.add_argument("--out", required=True, help="输出 JSON 路径，'-' 输出到 stdout")
     s.set_defaults(func=cmd_search)
 
-    f = sub.add_parser("fetch", help="按 PMID 列表拉取元数据")
+    f: argparse.ArgumentParser = sub.add_parser("fetch", help="按 PMID 列表拉取元数据")
     f.add_argument("--ids", required=True, help="逗号分隔的 PMID")
     f.add_argument("--batch", type=int, default=200)
     f.add_argument(
@@ -877,13 +947,13 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--out", required=True)
     f.set_defaults(func=cmd_fetch)
 
-    m = sub.add_parser("mesh", help="校验术语是否为 MeSH 主题词")
+    m: argparse.ArgumentParser = sub.add_parser("mesh", help="校验术语是否为 MeSH 主题词")
     m.add_argument("terms", nargs="*", help="待校验术语（英文，含空格的词加引号）")
     m.add_argument("--terms-file", default=None, help="从 UTF-8 文件读取术语（每行一个）")
     m.add_argument("--out", default="-", help="输出 JSON 路径，默认 stdout")
     m.set_defaults(func=cmd_mesh)
 
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
     return args.func(args)
 
 

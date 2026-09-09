@@ -24,17 +24,18 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from typing import IO, Any
 
-USER_AGENT = "workbuddy-medlit-skill/1.0 (PMC OA download)"
-OA_FCGI = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
-IDCONV = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+USER_AGENT: str = "workbuddy-medlit-skill/1.0 (PMC OA download)"
+OA_FCGI: str = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+IDCONV: str = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 
-_next = 0.0
+_next: float = 0.0
 
 
 def _wait() -> None:
     global _next
-    now = time.monotonic()
+    now: float = time.monotonic()
     if now < _next:
         time.sleep(_next - now)
     _next = time.monotonic() + 1.0 / 3.0  # 3 req/s
@@ -42,6 +43,7 @@ def _wait() -> None:
 
 def http_get(url: str, timeout: int = 120, retries: int = 3) -> bytes:
     last: Exception | None = None
+    req: urllib.request.Request
     for attempt in range(retries):
         _wait()
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -55,20 +57,21 @@ def http_get(url: str, timeout: int = 120, retries: int = 3) -> bytes:
 
 
 def slugify(text: str, n: int = 40) -> str:
-    s = re.sub(r"[^\w\s-]", "", text or "", flags=re.UNICODE)
+    s: str = re.sub(r"[^\w\s-]", "", text or "", flags=re.UNICODE)
     s = re.sub(r"[\s-]+", "_", s).strip("_")
     return s[:n] or "untitled"
 
 
 def pmid_to_pmcid(pmid: str, email: str | None, api_key: str | None) -> str:
-    params = {"ids": pmid, "format": "json", "tool": "workbuddy_medlit"}
+    params: dict[str, str] = {"ids": pmid, "format": "json", "tool": "workbuddy_medlit"}
     if email:
         params["email"] = email
     if api_key:
         params["api_key"] = api_key
-    url = f"{IDCONV}?{urllib.parse.urlencode(params)}"
+    url: str = f"{IDCONV}?{urllib.parse.urlencode(params)}"
     try:
-        data = json.loads(http_get(url).decode("utf-8"))
+        data: dict[str, Any] = json.loads(http_get(url).decode("utf-8"))
+        rec: dict[str, Any]
         for rec in data.get("records", []):
             if rec.get("pmid") == pmid and rec.get("pmcid"):
                 return rec["pmcid"]
@@ -79,25 +82,26 @@ def pmid_to_pmcid(pmid: str, email: str | None, api_key: str | None) -> str:
 
 def oa_links(pmcid: str, email: str | None, api_key: str | None) -> dict[str, str]:
     """oa.fcgi -> {'pdf': url, 'tgz': url}；非 OA 返回空 dict。"""
-    params = {"id": pmcid}
+    params: dict[str, str] = {"id": pmcid}
     if email:
         params["email"] = email
     if api_key:
         params["api_key"] = api_key
-    url = f"{OA_FCGI}?{urllib.parse.urlencode(params)}"
+    url: str = f"{OA_FCGI}?{urllib.parse.urlencode(params)}"
     try:
-        raw = http_get(url).decode("utf-8", errors="replace")
+        raw: str = http_get(url).decode("utf-8", errors="replace")
     except Exception as e:  # noqa: BLE001
         print(f"  [oa.fcgi] {pmcid} 查询失败: {e}", file=sys.stderr)
         return {}
-    root = ET.fromstring(raw)
-    rec = root.find(".//record")
+    root: ET.Element = ET.fromstring(raw)
+    rec: ET.Element | None = root.find(".//record")
     if rec is None:
         return {}
     links: dict[str, str] = {}
+    link: ET.Element
     for link in rec.findall(".//link"):
-        fmt = link.get("format", "")
-        href = link.get("href", "")
+        fmt: str = link.get("format", "")
+        href: str = link.get("href", "")
         if not href:
             continue
         # 保留原始 ftp:// href，下载阶段由 candidate_urls 生成 HTTPS/deprecated 候选
@@ -113,11 +117,12 @@ def candidate_urls(href: str) -> list[str]:
     """
     cands: list[str] = []
     if href.startswith("ftp://ftp.ncbi.nlm.nih.gov/"):
-        path = href[len("ftp://ftp.ncbi.nlm.nih.gov/"):]
-        https = "https://ftp.ncbi.nlm.nih.gov/" + path
+        path: str = href[len("ftp://ftp.ncbi.nlm.nih.gov/"):]
+        https: str = "https://ftp.ncbi.nlm.nih.gov/" + path
+        legacy_dir: str
         for legacy_dir in ("pub/pmc/oa_package/", "pub/pmc/oa_pdf/", "pub/pmc/oa_bulk/"):
             if legacy_dir in path:
-                dep = path.replace(legacy_dir, "pub/pmc/deprecated/" + legacy_dir.split("/", 2)[-1], 1)
+                dep: str = path.replace(legacy_dir, "pub/pmc/deprecated/" + legacy_dir.split("/", 2)[-1], 1)
                 cands.append("https://ftp.ncbi.nlm.nih.gov/" + dep)
                 break
         cands.append(https)
@@ -129,6 +134,7 @@ def candidate_urls(href: str) -> list[str]:
 
 def fetch_first(cands: list[str], timeout: int = 300) -> tuple[bytes, str]:
     last: Exception | None = None
+    url: str
     for url in cands:
         try:
             return http_get(url, timeout=timeout), url
@@ -141,6 +147,9 @@ def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
     """OA tgz 内通常含 <article>.pdf（及 XML/图片）；抽出 PDF 便于直接阅读。"""
     import tarfile
 
+    member: tarfile.TarInfo
+    data: tarfile.ExFileObject | None
+    pdf_path: str
     try:
         with tarfile.open(tgz_path, "r:gz") as tar:
             for member in tar.getmembers():
@@ -149,6 +158,7 @@ def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
                     if data is None:
                         continue
                     pdf_path = os.path.join(outdir, base + ".pdf")
+                    f: IO[bytes]
                     with open(pdf_path, "wb") as f:
                         f.write(data.read())
                     return pdf_path
@@ -157,9 +167,9 @@ def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
     return ""
 
 
-def download_one(paper: dict, outdir: str, email: str | None, api_key: str | None) -> dict:
-    pmid = str(paper.get("pmid", ""))
-    entry = {
+def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key: str | None) -> dict[str, Any]:
+    pmid: str = str(paper.get("pmid", ""))
+    entry: dict[str, Any] = {
         "pmid": pmid,
         "title": paper.get("title", ""),
         "status": "error",
@@ -167,7 +177,7 @@ def download_one(paper: dict, outdir: str, email: str | None, api_key: str | Non
         "message": "",
         "landing_url": "",
     }
-    pmcid = paper.get("pmc") or pmid_to_pmcid(pmid, email, api_key)
+    pmcid: str = paper.get("pmc") or pmid_to_pmcid(pmid, email, api_key)
     if not pmcid:
         entry["status"] = "not_oa"
         entry["message"] = "未收录于 PMC，非开放获取或暂无免费全文"
@@ -176,8 +186,9 @@ def download_one(paper: dict, outdir: str, email: str | None, api_key: str | Non
         )
         return entry
 
-    links = oa_links(pmcid, email, api_key)
-    href, ext = "", ""
+    links: dict[str, str] = oa_links(pmcid, email, api_key)
+    href: str = ""
+    ext: str = ""
     if links.get("pdf"):
         href, ext = links["pdf"], ".pdf"
     elif links.get("tgz"):
@@ -188,17 +199,20 @@ def download_one(paper: dict, outdir: str, email: str | None, api_key: str | Non
         entry["landing_url"] = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
         return entry
 
-    fname = f"{pmid}_{slugify(paper.get('title', ''))}{ext}"
-    fpath = os.path.join(outdir, fname)
+    fname: str = f"{pmid}_{slugify(paper.get('title', ''))}{ext}"
+    fpath: str = os.path.join(outdir, fname)
     try:
+        data: bytes
+        used_url: str
         data, used_url = fetch_first(candidate_urls(href), timeout=300)
-        with open(fpath, "wb") as f:
-            f.write(data)
+        f2: IO[bytes]
+        with open(fpath, "wb") as f2:
+            f2.write(data)
         entry["status"] = "downloaded"
         entry["file"] = fpath
         entry["message"] = f"{pmcid} -> {fname} ({len(data) // 1024} KB)"
         if ext == ".tgz":
-            pdf = extract_pdf_from_tgz(fpath, outdir, fname[:-4])
+            pdf: str = extract_pdf_from_tgz(fpath, outdir, fname[:-4])
             if pdf:
                 entry["file"] = pdf
                 entry["message"] += f"；已解出 PDF: {os.path.basename(pdf)}"
@@ -209,11 +223,13 @@ def download_one(paper: dict, outdir: str, email: str | None, api_key: str | Non
     return entry
 
 
-def load_papers(path: str) -> list[dict]:
+def load_papers(path: str) -> list[dict[str, Any]]:
+    data: Any
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, list):
         return data
+    key: str
     for key in ("papers", "included", "results"):
         if isinstance(data, dict) and isinstance(data.get(key), list):
             return data[key]
@@ -221,33 +237,37 @@ def load_papers(path: str) -> list[dict]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="PMC 开放获取原文下载")
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(description="PMC 开放获取原文下载")
     ap.add_argument("--input", required=True, help="pubmed.py 产出的 JSON / 筛选结果 JSON")
     ap.add_argument("--ids", default=None, help="只下载这些 PMID（逗号分隔），默认全部")
     ap.add_argument("--outdir", required=True, help="保存目录")
     ap.add_argument("--email", default=None)
     ap.add_argument("--api-key", default=os.environ.get("NCBI_API_KEY"))
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
 
-    papers = load_papers(args.input)
+    papers: list[dict[str, Any]] = load_papers(args.input)
     if args.ids:
-        keep = {x.strip() for x in args.ids.split(",") if x.strip()}
+        keep: set[str] = {x.strip() for x in args.ids.split(",") if x.strip()}
         papers = [p for p in papers if str(p.get("pmid", "")) in keep]
     os.makedirs(args.outdir, exist_ok=True)
 
-    manifest = []
-    ok = 0
+    manifest: list[dict[str, Any]] = []
+    ok: int = 0
+    i: int
+    p: dict[str, Any]
+    entry: dict[str, Any]
     for i, p in enumerate(papers, 1):
         entry = download_one(p, args.outdir, args.email, args.api_key)
         manifest.append(entry)
         ok += entry["status"] == "downloaded"
         print(f"[{i}/{len(papers)}] {entry['pmid']}: {entry['status']} {entry['message']}", file=sys.stderr)
 
-    mpath = os.path.join(args.outdir, "manifest.json")
-    with open(mpath, "w", encoding="utf-8") as f:
+    mpath: str = os.path.join(args.outdir, "manifest.json")
+    f3: IO[str]
+    with open(mpath, "w", encoding="utf-8") as f3:
         json.dump(
             {"downloaded": ok, "total": len(papers), "items": manifest},
-            f, ensure_ascii=False, indent=2,
+            f3, ensure_ascii=False, indent=2,
         )
     print(f"[download] {ok}/{len(papers)} 篇已下载，manifest: {mpath}", file=sys.stderr)
     return 0

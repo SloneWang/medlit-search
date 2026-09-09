@@ -16,10 +16,13 @@ import os
 import re
 import sys
 import time
+from typing import Any
 
 # 复用 pubmed.py 的 MEDLINE 解析器，避免重复实现
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pubmed import parse_medline, record_to_paper  # type: ignore
+
+Paper = dict[str, Any]
 
 
 def _first(mapping: dict[str, list[str]], key: str) -> str:
@@ -34,17 +37,17 @@ def _all(mapping: dict[str, list[str]], key: str) -> list[str]:
 # RIS
 # ---------------------------------------------------------------------------
 
-_RIS_JOURNAL_TAGS = {"T2", "JF", "JA", "JO"}
-_RIS_DATE_TAGS = {"PY", "DA", "Y1", "Y2"}
+_RIS_JOURNAL_TAGS: set[str] = {"T2", "JF", "JA", "JO"}
+_RIS_DATE_TAGS: set[str] = {"PY", "DA", "Y1", "Y2"}
 
 
-def parse_ris(text: str) -> list[dict]:
+def parse_ris(text: str) -> list[Paper]:
     """解析 RIS 格式；每条记录以 TY 开始、ER 结束。"""
     records: list[dict[str, list[str]]] = []
     current: dict[str, list[str]] | None = None
 
     for raw in text.splitlines():
-        line = raw.strip()
+        line: str = raw.strip()
         if len(line) < 4 or line.startswith("ER"):
             current = None
             continue
@@ -55,33 +58,34 @@ def parse_ris(text: str) -> list[dict]:
         if current is None:
             continue
         # tag 为前 2 个大写字母；值从第 6 列起
-        tag = line[:2].upper()
-        value = line[6:].strip() if len(line) > 6 else ""
+        tag: str = line[:2].upper()
+        value: str = line[6:].strip() if len(line) > 6 else ""
         current.setdefault(tag, []).append(value)
 
-    papers: list[dict] = []
+    papers: list[Paper] = []
     for rec in records:
-        pmid = _first(rec, "AN")
-        doi = _first(rec, "DO")
-        url = _first(rec, "UR")
+        pmid: str = _first(rec, "AN")
+        doi: str = _first(rec, "DO")
+        url: str = _first(rec, "UR")
         if not url and pmid:
             url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
         if not url and doi:
             url = f"https://doi.org/{doi}"
 
-        date = _first(rec, "DA") or _first(rec, "PY") or _first(rec, "Y1")
+        date: str = _first(rec, "DA") or _first(rec, "PY") or _first(rec, "Y1")
         date = re.sub(r"/(\d{2})/(\d{2})$", r"-\1-\2", date)  # RIS 常见 YYYY/MM/DD
         date = re.sub(r"/", "-", date)
 
-        journal = ""
+        journal: str = ""
         for tag in _RIS_JOURNAL_TAGS:
             if tag in rec:
                 journal = _first(rec, tag)
                 break
 
         # SP/EP 合并为页码
-        sp, ep = _first(rec, "SP"), _first(rec, "EP")
-        pages = f"{sp}-{ep}" if sp and ep else (sp or _first(rec, "CP"))
+        sp: str = _first(rec, "SP")
+        ep: str = _first(rec, "EP")
+        pages: str = f"{sp}-{ep}" if sp and ep else (sp or _first(rec, "CP"))
 
         papers.append({
             "pmid": pmid,
@@ -112,6 +116,11 @@ def parse_ris(text: str) -> list[dict]:
 # BibTeX
 # ---------------------------------------------------------------------------
 
+_BIB_RE: re.Pattern[str] = re.compile(
+    r"@\w+\s*\{\s*[^,]*,\s*(?P<body>.*?)\n\s*\}\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+
 
 def _bib_unbrace(s: str) -> str:
     """去掉 BibTeX 值最外层 {} 或 ""，不做 LaTeX 反斜杠展开。"""
@@ -124,9 +133,9 @@ def _bib_unbrace(s: str) -> str:
 def _bib_split_body(body: str) -> dict[str, str]:
     """按顶层逗号拆分字段；大括号可嵌套，引号内不拆分。"""
     fields: dict[str, str] = {}
-    depth = 0
+    depth: int = 0
     in_quote: str | None = None
-    start = 0
+    start: int = 0
     for i, ch in enumerate(body):
         if ch == "{":
             if not in_quote:
@@ -141,8 +150,10 @@ def _bib_split_body(body: str) -> dict[str, str]:
                 elif in_quote == ch:
                     in_quote = None
         elif ch == "," and depth == 0 and in_quote is None:
-            part = body[start:i].strip()
+            part: str = body[start:i].strip()
             if "=" in part:
+                k: str
+                v: str
                 k, v = part.split("=", 1)
                 fields[k.strip().lower()] = _bib_unbrace(v.strip())
             start = i + 1
@@ -155,41 +166,41 @@ def _bib_split_body(body: str) -> dict[str, str]:
 
 def _bib_authors(raw: str) -> list[str]:
     """BibTeX author: 'Voors, Adriaan A and Doe, John' -> ['Voors, Adriaan A', 'Doe, John']。"""
-    parts = re.split(r"\s+and\s+", raw, flags=re.IGNORECASE)
+    parts: list[str] = re.split(r"\s+and\s+", raw, flags=re.IGNORECASE)
     return [p.strip() for p in parts if p.strip()]
 
 
-def parse_bibtex(text: str) -> list[dict]:
+def parse_bibtex(text: str) -> list[Paper]:
     """简单 BibTeX 解析：支持 @article / @inproceedings 等，保留 abstract。"""
-    papers: list[dict] = []
+    papers: list[Paper] = []
     # 规范化条目边界：@xxx { ..., }
     text = re.sub(r"(\n\s*)+\}", "\n}", text)
     for m in re.finditer(r"@(\w+)\s*\{\s*([^,]+),\s*(.*?)\n\s*\}", text, re.DOTALL):
-        body = m.group(3)
-        fields = _bib_split_body(body)
+        body: str = m.group(3)
+        fields: dict[str, str] = _bib_split_body(body)
         if not fields:
             continue
 
-        authors = _bib_authors(fields.get("author", ""))
-        year = fields.get("year", "")
-        month = fields.get("month", "")
-        date = year
+        authors: list[str] = _bib_authors(fields.get("author", ""))
+        year: str = fields.get("year", "")
+        month: str = fields.get("month", "")
+        date: str = year
         if month:
             # 尝试把英文月名转成 01-12
             try:
                 import calendar
-                mm = list(calendar.month_abbr).index(month[:3].title())
+                mm: int = list(calendar.month_abbr).index(month[:3].title())
                 if mm:
                     date = f"{year}-{mm:02d}"
             except Exception:
                 date = f"{year}-{month}"
 
-        doi = fields.get("doi", "")
-        url = fields.get("url", "")
+        doi: str = fields.get("doi", "")
+        url: str = fields.get("url", "")
         if not url and doi:
             url = f"https://doi.org/{doi}"
 
-        pages = fields.get("pages", "")
+        pages: str = fields.get("pages", "")
         pages = pages.replace("--", "-")
 
         papers.append({
@@ -221,15 +232,15 @@ def parse_bibtex(text: str) -> list[dict]:
 # MEDLINE (复用 pubmed.py)
 # ---------------------------------------------------------------------------
 
-def parse_medline_import(text: str) -> list[dict]:
-    records = parse_medline(text)
+def parse_medline_import(text: str) -> list[Paper]:
+    records: list[list[tuple[str, str]]] = parse_medline(text)
     return [record_to_paper(r) for r in records]
 
 
 # ---------------------------------------------------------------------------
 
-def _dump(obj: dict, out: str) -> None:
-    text = json.dumps(obj, ensure_ascii=False, indent=2)
+def _dump(obj: Paper, out: str) -> None:
+    text: str = json.dumps(obj, ensure_ascii=False, indent=2)
     if out == "-" or not out:
         sys.stdout.write(text + "\n")
     else:
@@ -239,7 +250,7 @@ def _dump(obj: dict, out: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="RIS / BibTeX / PubMed 文献导入为统一 JSON")
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(description="RIS / BibTeX / PubMed 文献导入为统一 JSON")
     ap.add_argument("--input", required=True, help="输入文件（.ris / .bib / .txt MEDLINE）")
     ap.add_argument(
         "--format",
@@ -248,12 +259,13 @@ def main(argv: list[str] | None = None) -> int:
         help="输入格式（根据扩展名自动推断失败时显式指定）",
     )
     ap.add_argument("--out", required=True, help="输出 JSON 路径，'-' 输出到 stdout")
-    args = ap.parse_args(argv)
+    args: argparse.Namespace = ap.parse_args(argv)
 
     with open(args.input, "r", encoding="utf-8") as f:
-        text = f.read()
+        text: str = f.read()
 
-    fmt = args.format
+    fmt: str = args.format
+    papers: list[Paper]
     if fmt == "ris":
         papers = parse_ris(text)
     elif fmt == "bibtex":
@@ -261,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         papers = parse_medline_import(text)
 
-    result = {
+    result: Paper = {
         "source": "import",
         "format": fmt,
         "import_date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
