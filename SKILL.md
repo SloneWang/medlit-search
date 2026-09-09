@@ -5,8 +5,15 @@ description: 医学文献检索与筛选工作流（当前支持 PubMed）。当
 
 # medlit-search — 医学文献检索与筛选工作流
 
-基于 SciSearch 桌面文献检索工具（同一作者）的 PubMed 检索流程封装：esearch 分页拿 PMID →
-efetch 拉 MEDLINE 文本 → 解析提取字段 → 限流 3/s（有 NCBI API key 10/s）。
+基于 SciSearch 桌面文献检索工具（同一作者）的 PubMed 检索流程封装：esearch 分页拿 PMID（默认用 usehistory）→
+efetch 拉 MEDLINE 文本或 PubMed XML → 解析提取字段 → 限流 3/s（有 NCBI API key 10/s）。
+
+参数语义严格对齐 NCBI E-utilities：
+- `--retmax`：ESearch 单次返回的 UID 数量（分页页大小，默认 200，最大 10000）。
+- `--limit`：用户希望拉取的文献总量（0=全部，默认 0）。
+- `--batch`：EFetch 单批拉取篇数（建议 ≤200，默认 200）。
+- `--retmode`：EFetch 返回格式，`medline`（默认，保留原始 MEDLINE 文本）或 `xml`（PubMed XML）。
+- `--usehistory`：默认开启，用 ESearch 历史会话（WebEnv/query_key）拉取记录，避免长 URL；可 `--no-usehistory` 退化到 ID 列表模式。
 
 ## 工作目录约定
 
@@ -69,15 +76,18 @@ exports/             所有导出产物
 
 ### 第 4 步：执行检索
 
-询问两个参数（用户不答则用默认）：
-- **日期范围**：`--mindate`/`--maxdate`（YYYY 或 YYYY/MM/DD，按发表日期 pdat 过滤）
-- **最大篇数**：`--retmax`（默认 100；0 = 全部，需提醒大结果集耗时）
+询问参数（用户不答则用默认）：
+- **日期范围**：`--mindate`/`--maxdate`（YYYY 或 YYYY/MM/DD）
+- **日期类型**：`--datetype`（默认 `pdat` 发表日期；可选 `edat` Entrez 录入日期、`mdat` MeSH 日期）
+- **ESearch 页大小**：`--retmax`（默认 200，最大 10000）
+- **拉取总量**：`--limit`（默认 0 = 全部；大结果集需提醒耗时）
+- **EFetch 格式**：`--retmode medline|xml`（默认 `medline`）
 
 执行（检索式必须经文件传入）：
 
 ```
 python scripts/pubmed.py search --query-file query.txt \
-    --mindate 2020 --retmax 100 --out results.json
+    --mindate 2020 --datetype pdat --retmax 200 --limit 100 --out results.json
 ```
 
 - 有 NCBI API key 时加 `--api-key`（或设环境变量 NCBI_API_KEY），速度 3/s→10/s。
@@ -111,11 +121,11 @@ python scripts/import.py --input pubmed_result.txt --format medline --out result
 2. 读取 results.json / screening.json，逐篇看 title+abstract 对照 PICOS 五要素。
 3. 每篇给结论：`include`（明确符合）/ `exclude`（明确不符，写排除理由）/
    `uncertain`（摘要信息不足，需全文判定）。
-4. 批量操作时每批 10-20 篇，输出简表（PMID、题录、结论、一句话理由）。
-5. 结果写入 `screening.json`：在 results.json 的每篇 paper 上加
+3. 批量操作时每批 10-20 篇，输出简表（PMID、题录、结论、一句话理由）。
+4. 结果写入 `screening.json`：在 results.json 的每篇 paper 上加
    `"decision": {"round1": "include|exclude|uncertain", "reason": "..."}` 后另存；
    同时写 `screening.md` 供人读（含 PRISMA 式计数：检索 n → 排除 n → 待定 n → 纳入 n）。
-6. 给用户看汇总，**排除清单必须经用户过目**。
+5. 给用户看汇总，**排除清单必须经用户过目**。
 
 **复筛**：按用户追加的标准（如"只留 RCT"、"排除动物实验"、"只要近 5 年"）
 对 include/uncertain 集合再过一遍，决策记入 `decision.round2`。
@@ -125,7 +135,7 @@ python scripts/import.py --input pubmed_result.txt --format medline --out result
 ### 第 6 步：原文下载（仅开放获取）
 
 ```
-python scripts/pubmed.py fetch --ids <pmid列表> --out selected.json   # 如需补齐元数据
+python scripts/pubmed.py fetch --ids <pmid列表> --retmode xml --out selected.json   # 如需补齐元数据
 python scripts/download.py --input selected.json --outdir papers/
 ```
 
