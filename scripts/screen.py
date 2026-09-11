@@ -25,7 +25,9 @@ import sys
 from typing import Any, Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from export import FIELD_LABELS, cell_value  # type: ignore
+from export import FIELD_LABELS, best_url, cell_value  # type: ignore
+
+MODES: tuple[str, ...] = ("prepare", "apply")
 
 
 def load_papers(path: str) -> list[dict[str, Any]]:
@@ -94,6 +96,21 @@ def screen_paper(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """分发：screen（默认，关键词预筛）/ prepare（出待填审查表）/ apply（回填决策）。"""
+    raw: list[str] = list(sys.argv[1:] if argv is None else argv)
+    mode: str = "screen"
+    rest: list[str] = raw
+    if raw and raw[0] in MODES:
+        mode = raw[0]
+        rest = raw[1:]
+    if mode == "prepare":
+        return main_prepare(rest)
+    if mode == "apply":
+        return main_apply(rest)
+    return main_screen(rest)
+
+
+def main_screen(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="基于摘要/标题关键词的文献初筛/复筛")
     ap.add_argument("--input", required=True, help="pubmed.py / import.py 产出的 JSON 路径")
     ap.add_argument("--include", default=None, help="纳入词，逗号分隔；--mode and 要求全中，--mode or 任一中")
@@ -197,6 +214,237 @@ def _write_screening_csv(papers: list[dict[str, Any]], out: str) -> None:
             d: dict[str, str] = _decision_text(p)
             row.extend([d.get(f, "") for f in _EXTRA_FIELDS])
             w.writerow(row)
+
+
+# ---------------------------------------------------------------------------
+# prepare / apply：可人工复核的审查表（v1.5）
+#
+#   prepare  生成"决策/理由"留空的 CSV，交给人或 LLM 逐篇填
+#   apply    把填好的 CSV 回填成 paper["decision"]，产出带 decision 的 JSON
+# ---------------------------------------------------------------------------
+
+_REVIEW_FIELDS: list[str] = ["pmid", "title", "authors", "journal", "date", "pub_types", "keywords", "abstract", "doi"]
+
+_DECISION_ALIASES: dict[str, str] = {
+    "include": "include", "inc": "include", "1": "include", "y": "include", "yes": "include", "纳入": "include",
+    "exclude": "exclude", "exc": "exclude", "0": "exclude", "n": "exclude", "no": "exclude", "排除": "exclude",
+    "uncertain": "uncertain", "unc": "uncertain", "?": "uncertain", "？": "uncertain", "待定": "uncertain",
+}
+
+
+def round_label(round_no: int) -> str:
+    if round_no == 1:
+        return "初筛"
+    if round_no == 2:
+        return "复筛"
+    return f"第{round_no}轮"
+
+
+def normalize_decision(raw: str) -> str:
+    """中英文/缩写/数字都接受；无法识别返回空串（调用方按未填写处理）。"""
+    return _DECISION_ALIASES.get((raw or "").strip().lower(), "")
+
+
+def write_review_table(papers: list[dict[str, Any]], out: str, round_no: int) -> int:
+    """写出待填写的审查表；决策列与理由列留空。返回写入行数。"""
+    label: str = round_label(round_no)
+    header: list[str] = ["序号", "PMID", "题目", "作者", "期刊", "发表日期", "文献类型", "关键词", "摘要", "DOI", "网址",
+                         f"{label}决策", f"{label}理由"]
+    with open(out, "w", encoding="utf-8-sig", newline="") as f:
+        w: Any = csv.writer(f)
+        w.writerow(header)
+        i: int
+        p: dict[str, Any]
+        for i, p in enumerate(papers, 1):
+            row: list[str] = [str(i)]
+            fld: str
+            for fld in _REVIEW_FIELDS:
+                row.append(cell_value(p, fld))
+            row.append(best_url(p))
+            row.append("")  # 决策：留给人工/LLM 填
+            row.append("")  # 理由
+            w.writerow(row)
+    return len(papers)
+
+
+def _norm_key(s: str) -> str:
+    """标题匹配用的归一化：小写 + 只保留字母数字与汉字。"""
+    return re.sub(r"[^\w\u4e00-\u9fff]", "", (s or "").lower())
+
+
+def _norm_doi_key(s: str) -> str:
+    out: str = (s or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"):
+        if out.startswith(prefix):
+            out = out[len(prefix):]
+            break
+    return out
+
+
+def pick_column(header: list[str], keyword: str, label: str) -> int:
+    """优先取带本轮标签的列（如"复筛决策"），否则退回首个含关键词的列。"""
+    i: int
+    h: str
+    for i, h in enumerate(header):
+        if keyword in (h or "") and label in (h or ""):
+            return i
+    for i, h in enumerate(header):
+        if keyword in (h or ""):
+            return i
+    return -1
+
+
+def apply_decision(paper: dict[str, Any], round_no: int, value: str, reason: str) -> None:
+    """写入 decision，保留其它轮次字段（先 apply round1 再 apply round2 不互相覆盖）。"""
+    old: Any = paper.get("decision")
+    dec: dict[str, Any] = dict(old) if isinstance(old, dict) else {}
+    if not isinstance(old, dict) and old:
+        dec = {"round1": str(old)}
+    dec.setdefault("round1", "")
+    dec.setdefault("reason", "")
+    dec.setdefault("round2", None)
+    dec.setdefault("reason2", "")
+    if round_no == 1:
+        dec["round1"] = value
+        dec["reason"] = reason
+    else:
+        dec[f"round{round_no}"] = value
+        dec[f"reason{round_no}"] = reason
+    paper["decision"] = dec
+
+
+def find_paper(
+    row: dict[str, str],
+    header: list[str],
+    by_pmid: dict[str, dict[str, Any]],
+    by_doi: dict[str, dict[str, Any]],
+    by_title: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """按 PMID > DOI > 标题 的顺序匹配回原 paper。"""
+    val: str = ""
+    h: str
+    for h in header:
+        if h and "PMID" in h.upper():
+            val = (row.get(h) or "").strip()
+            break
+    if val and val in by_pmid:
+        return by_pmid[val]
+    for h in header:
+        if h and "DOI" in h.upper():
+            val = (row.get(h) or "").strip()
+            break
+    key: str = _norm_doi_key(val)
+    if key and key in by_doi:
+        return by_doi[key]
+    for h in header:
+        if h and "题目" in h:
+            val = (row.get(h) or "").strip()
+            break
+    tkey: str = _norm_key(val)
+    if tkey and tkey in by_title:
+        return by_title[tkey]
+    return None
+
+
+def main_prepare(argv: list[str]) -> int:
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="生成待填写的审查表 CSV（决策/理由列留空）"
+    )
+    ap.add_argument("--input", required=True, help="pool JSON 路径")
+    ap.add_argument("--out", required=True, help="审查表 CSV 输出路径")
+    ap.add_argument("--round", type=int, default=1, help="轮次：1=初筛，2=复筛（默认 1）")
+    args: argparse.Namespace = ap.parse_args(argv)
+
+    papers: list[dict[str, Any]] = load_papers(args.input)
+    if not papers:
+        print("[screen] prepare: 输入中无论文", file=sys.stderr)
+        return 1
+    n: int = write_review_table(papers, args.out, args.round)
+    print(f"[screen] prepare: 写入 {n} 行（{round_label(args.round)}审查表，决策/理由列留空）-> {args.out}",
+          file=sys.stderr)
+    return 0
+
+
+def main_apply(argv: list[str]) -> int:
+    ap: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="把填写好的审查表 CSV 回填为带 decision 的 JSON"
+    )
+    ap.add_argument("--input", required=True, help="pool JSON 路径（与 prepare 同源）")
+    ap.add_argument("--review", required=True, help="填写好的审查表 CSV")
+    ap.add_argument("--out", required=True, help="输出 JSON 路径")
+    ap.add_argument("--round", type=int, default=1, help="轮次：1=初筛，2=复筛（默认 1）")
+    args: argparse.Namespace = ap.parse_args(argv)
+
+    papers: list[dict[str, Any]] = load_papers(args.input)
+    by_pmid: dict[str, dict[str, Any]] = {}
+    by_doi: dict[str, dict[str, Any]] = {}
+    by_title: dict[str, dict[str, Any]] = {}
+    p: dict[str, Any]
+    for p in papers:
+        pmid: str = str(p.get("pmid") or "").strip()
+        if pmid:
+            by_pmid.setdefault(pmid, p)
+        doi: str = _norm_doi_key(str(p.get("doi") or ""))
+        if doi:
+            by_doi.setdefault(doi, p)
+        tk: str = _norm_key(str(p.get("title") or ""))
+        if tk:
+            by_title.setdefault(tk, p)
+
+    with open(args.review, "r", encoding="utf-8-sig", newline="") as f:
+        reader: Any = csv.DictReader(f)
+        header: list[str] = list(reader.fieldnames or [])
+        rows: list[dict[str, str]] = [dict(r) for r in reader]
+
+    label: str = round_label(args.round)
+    dec_i: int = pick_column(header, "决策", label)
+    rea_i: int = pick_column(header, "理由", label)
+    if dec_i < 0:
+        print(f"[screen] apply: 审查表里找不到决策列（表头：{header}）", file=sys.stderr)
+        return 2
+    dec_col: str = header[dec_i]
+    rea_col: str = header[rea_i] if rea_i >= 0 else ""
+
+    counts: dict[str, int] = {"include": 0, "exclude": 0, "uncertain": 0, "unfilled": 0}
+    unmatched: int = 0
+    row: dict[str, str]
+    for row in rows:
+        raw: str = (row.get(dec_col) or "").strip()
+        if not raw:
+            counts["unfilled"] += 1
+            continue
+        value: str = normalize_decision(raw)
+        if not value:
+            print(f"[screen] apply: 无法识别的决策值，按未填写跳过：{raw!r}", file=sys.stderr)
+            counts["unfilled"] += 1
+            continue
+        hit: dict[str, Any] | None = find_paper(row, header, by_pmid, by_doi, by_title)
+        if hit is None:
+            unmatched += 1
+            print(f"[screen] apply: 未匹配到原文献，已跳过：{row.get('PMID', '')} {row.get('题目', '')[:30]}",
+                  file=sys.stderr)
+            continue
+        apply_decision(hit, args.round, value, (row.get(rea_col) or "").strip() if rea_col else "")
+        counts[value] += 1
+
+    result: dict[str, Any] = {
+        "source": "screen",
+        "round": args.round,
+        "counts": counts,
+        "papers": papers,
+    }
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    print(f"[screen] apply: round{args.round} include={counts['include']}, exclude={counts['exclude']}, "
+          f"uncertain={counts['uncertain']}, unfilled={counts['unfilled']}", file=sys.stderr)
+    if counts["unfilled"]:
+        print(f"[screen] apply: 有 {counts['unfilled']} 行决策为空或无法识别，已跳过、未改动这些文献的 decision",
+              file=sys.stderr)
+    if unmatched:
+        print(f"[screen] apply: {unmatched} 行未能匹配回原文献", file=sys.stderr)
+    print(f"[screen] apply: 结果写入 {args.out}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
