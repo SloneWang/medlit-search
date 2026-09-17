@@ -26,15 +26,25 @@ from typing import Any, TextIO
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, FIELDS, cell_value  # type: ignore
 
+# 导出 CSV 的基础字段序列（顺序即列顺序）
 _CSV_FIELDS: list[str] = [
     "pmid", "title", "authors", "journal", "date",
     "keywords", "mesh", "abstract", "doi", "url",
 ]
 
+# 初筛/复筛追加的决策字段（paper['decision'] 中的键）
 _EXTRA_FIELDS: list[str] = ["round1", "reason", "round2", "reason2"]
 
 
 def _load_json(path: str) -> dict[str, Any] | list[Any] | None:
+    """容错读取 JSON 文件。
+
+    参数:
+        path: 文件路径。
+
+    返回:
+        解析后的对象；文件不存在或解析失败返回 None。
+    """
     if not os.path.exists(path):
         return None
     try:
@@ -46,6 +56,14 @@ def _load_json(path: str) -> dict[str, Any] | list[Any] | None:
 
 
 def _extract_papers(data: Any) -> list[dict[str, Any]]:
+    """从 JSON 数据中取出论文数组。
+
+    参数:
+        data: 解析后的 JSON 对象；支持纯数组或含 papers/included/results 键的对象。
+
+    返回:
+        论文字典列表；均不符合时返回空列表。
+    """
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -56,7 +74,15 @@ def _extract_papers(data: Any) -> list[dict[str, Any]]:
 
 
 def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
-    """从 paper['decision'] 提取可读的决策字段。"""
+    """从 paper['decision'] 提取可读的决策字段。
+
+    参数:
+        paper: 论文字典；decision 为 dict 时逐项取 round1/reason/round2/reason2，
+            否则把 decision 本身当作 round1 的字符串值。
+
+    返回:
+        含 round1/reason/round2/reason2 四个键的字典，缺失项为空串。
+    """
     decision: Any = paper.get("decision") or {}
     if isinstance(decision, dict):
         return {
@@ -69,7 +95,16 @@ def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
 
 
 def write_papers_csv(papers: list[dict[str, Any]], out: str, include_decision: bool = False) -> None:
-    """导出统一 paper 列表到 CSV。"""
+    """导出统一 paper 列表到 CSV（utf-8-sig）。
+
+    参数:
+        papers: 论文列表。
+        out: 输出文件路径。
+        include_decision: 为 True 时追加 round1/reason/round2/reason2 四列。
+
+    返回:
+        无。
+    """
     fields: list[str] = list(_CSV_FIELDS)
     if include_decision:
         fields.extend(_EXTRA_FIELDS)
@@ -89,6 +124,18 @@ def write_papers_csv(papers: list[dict[str, Any]], out: str, include_decision: b
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口：把任务目录的检索/筛选结果导出为三份审查 CSV。
+
+    三分支回退链：全部文献取 results.json；初筛结果取 screening.json；
+    最终纳入优先 selected.json，否则从 screening 中取 round2 include，
+    或 round1 include 且无 round2 的论文。
+
+    参数:
+        argv: 参数列表；None 时取 sys.argv。
+
+    返回:
+        0 成功；1 无任何可导出结果。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(description="检索/初筛/复筛结果导出为审查 CSV")
     ap.add_argument("--dir", required=True, help="任务目录路径（含 results.json / screening.json / selected.json）")
     ap.add_argument("--outdir", default=None, help="CSV 输出目录，默认与 --dir 相同")
@@ -118,12 +165,13 @@ def main(argv: list[str] | None = None) -> int:
         write_papers_csv(screened_papers, out_screen, include_decision=True)
         print(f"[workflow] 初筛结果 {len(screened_papers)} 篇 -> {out_screen}", file=sys.stderr)
 
-    # 3) 最终纳入
+    # 3) 最终纳入：优先 selected.json，否则从初筛结果回退推导
     selected_papers: list[dict[str, Any]] = []
     selected_data: dict[str, Any] | list[Any] | None = _load_json(selected_path)
     if selected_data:
         selected_papers = _extract_papers(selected_data)
     elif screened_papers:
+        # 回退链：round2 判定 include；或 round1 include 且未做 round2
         selected_papers = [
             p for p in screened_papers
             if (_decision_text(p).get("round2") == "include")

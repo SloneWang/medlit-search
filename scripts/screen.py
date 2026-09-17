@@ -27,10 +27,22 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, best_url, cell_value  # type: ignore
 
+# 支持的一级子命令：prepare 出待填审查表，apply 回填决策
 MODES: tuple[str, ...] = ("prepare", "apply")
 
 
 def load_papers(path: str) -> list[dict[str, Any]]:
+    """从 JSON 文件中载入文献数组。
+
+    参数:
+        path: JSON 文件路径；可为纯数组，或含 papers/included/results 键的对象。
+
+    返回:
+        文献字典列表。
+
+    异常:
+        ValueError: JSON 中找不到论文数组时抛出。
+    """
     with open(path, "r", encoding="utf-8") as f:
         data: Any = json.load(f)
     if isinstance(data, list):
@@ -42,22 +54,54 @@ def load_papers(path: str) -> list[dict[str, Any]]:
 
 
 def split_terms(text: str | None) -> list[str]:
+    """把逗号分隔的关键词串拆成去空白的词列表。
+
+    参数:
+        text: 逗号分隔的关键词串；None 或空串返回空列表。
+
+    返回:
+        去空白、去空项的关键词列表。
+    """
     if not text:
         return []
     return [t.strip() for t in text.split(",") if t.strip()]
 
 
 def build_matcher(term: str, regex: bool, case_sensitive: bool) -> Callable[[str], bool]:
+    """按参数构造一个"文本 -> 是否命中"的匹配器函数（两种匹配模式的工厂）。
+
+    参数:
+        term: 单个关键词；regex=True 时按正则编译，否则按子串匹配。
+        regex: 是否把关键词当作正则表达式。
+        case_sensitive: 是否大小写敏感；子串模式会在不敏感时先统一转小写。
+
+    返回:
+        单参数可调用对象，接收待匹配文本并返回布尔命中结果。
+
+    异常:
+        re.error: regex 模式下关键词不是合法正则时由 re.compile 抛出。
+    """
     flags: int = 0 if case_sensitive else re.IGNORECASE
     if regex:
+        # 正则模式：预编译一次，匹配器只做 search
         pattern: re.Pattern[str] = re.compile(term, flags)
         return lambda text: bool(pattern.search(text))
     else:
+        # 子串模式：不区分大小写时，把关键词与文本都统一转小写再比较
         target: str = term if case_sensitive else term.lower()
         return lambda text: target in (text if case_sensitive else text.lower())
 
 
 def get_text(paper: dict[str, Any], field: str) -> str:
+    """按筛选范围（title / abstract / title+abstract）拼接待匹配文本。
+
+    参数:
+        paper: 文献字典，读取其 title / abstract 字段。
+        field: 匹配范围：title、abstract 或 title+abstract。
+
+    返回:
+        拼接后的文本（缺字段时为空串）。
+    """
     parts: list[str] = []
     if field in ("title", "title+abstract"):
         parts.append(paper.get("title", ""))
@@ -75,15 +119,30 @@ def screen_paper(
     regex: bool,
     case_sensitive: bool,
 ) -> tuple[str, str]:
+    """对单篇文献做三级判定：exclude 优先 -> include 命中规则 -> uncertain。
+
+    参数:
+        paper: 待筛选文献字典。
+        includes: 纳入关键词列表；mode=and 要求全部命中，mode=or 任一命中。
+        excludes: 排除关键词列表；任一命中即直接排除。
+        field: 匹配范围（title / abstract / title+abstract）。
+        mode: 多个 include 词的关系："and"（全部命中）或 "or"（任一命中）。
+        regex: 是否按正则匹配。
+        case_sensitive: 是否大小写敏感。
+
+    返回:
+        (decision, reason) 二元组；decision 为 include/exclude/uncertain，
+        reason 为命中词或未命中的说明文字。
+    """
     text: str = get_text(paper, field)
     title: str = paper.get("title", "")
 
-    # 1. exclude 优先
+    # 1. exclude 优先：任一排除词命中即直接排除，不再看纳入词
     for term in excludes:
         if build_matcher(term, regex, case_sensitive)(text):
             return "exclude", f"{field} 命中排除词: {term}"
 
-    # 2. include
+    # 2. include：and 模式要求全部纳入词命中，or 模式任一命中即可
     if includes:
         hits: list[str] = [term for term in includes if build_matcher(term, regex, case_sensitive)(text)]
         if mode == "and" and len(hits) == len(includes):
@@ -91,7 +150,7 @@ def screen_paper(
         if mode == "or" and hits:
             return "include", f"{field} 命中纳入词: {', '.join(hits)}"
 
-    # 3. uncertain
+    # 3. uncertain：既未命中排除词、也未满足纳入条件，留给下一轮人工/LLM 判断
     return "uncertain", f"{field} 未命中任何纳入/排除词"
 
 
@@ -111,6 +170,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def main_screen(argv: list[str]) -> int:
+    """执行关键词预筛：逐篇判定并写出带 decision 字段的 JSON（可选同名 CSV）。
+
+    参数:
+        argv: 命令行参数列表（不含脚本名）。
+
+    返回:
+        退出码；0 成功，2 表示既未提供 --include 也未提供 --exclude。
+    """
     ap = argparse.ArgumentParser(description="基于摘要/标题关键词的文献初筛/复筛")
     ap.add_argument("--input", required=True, help="pubmed.py / import.py 产出的 JSON 路径")
     ap.add_argument("--include", default=None, help="纳入词，逗号分隔；--mode and 要求全中，--mode or 任一中")
@@ -188,11 +255,21 @@ def main_screen(argv: list[str]) -> int:
     return 0
 
 
+# 同名 CSV 审查表的文献字段（按此顺序输出）
 _CSV_FIELDS: list[str] = ["pmid", "title", "authors", "journal", "date", "keywords", "mesh", "abstract", "doi", "url"]
+# 追加在文献字段后的决策字段
 _EXTRA_FIELDS: list[str] = ["round1", "reason", "round2", "reason2"]
 
 
 def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
+    """把文献的 decision 字段统一展开为四个文本列。
+
+    参数:
+        paper: 文献字典；decision 可为 dict、纯字符串或缺失。
+
+    返回:
+        含 round1/reason/round2/reason2 四个键的字典，缺失项补空串。
+    """
     decision: Any = paper.get("decision") or {}
     if isinstance(decision, dict):
         return {
@@ -205,6 +282,15 @@ def _decision_text(paper: dict[str, Any]) -> dict[str, str]:
 
 
 def _write_screening_csv(papers: list[dict[str, Any]], out: str) -> None:
+    """把筛选结果写出为 utf-8-sig 编码的 CSV 审查表（Excel 可直接打开）。
+
+    参数:
+        papers: 已带 decision 字段的文献列表。
+        out: 输出 CSV 路径。
+
+    返回:
+        None。
+    """
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
         w: Any = csv.writer(f)
         header: list[str] = [FIELD_LABELS.get(f, f) for f in _CSV_FIELDS + _EXTRA_FIELDS]
@@ -223,8 +309,10 @@ def _write_screening_csv(papers: list[dict[str, Any]], out: str) -> None:
 #   apply    把填好的 CSV 回填成 paper["decision"]，产出带 decision 的 JSON
 # ---------------------------------------------------------------------------
 
+# prepare 生成的待填审查表所包含的文献字段（按此顺序输出）
 _REVIEW_FIELDS: list[str] = ["pmid", "title", "authors", "journal", "date", "pub_types", "keywords", "abstract", "doi"]
 
+# 决策值别名映射：兼容中英文、缩写、数字与符号写法，全部归一到 include/exclude/uncertain
 _DECISION_ALIASES: dict[str, str] = {
     "include": "include", "inc": "include", "1": "include", "y": "include", "yes": "include", "纳入": "include",
     "exclude": "exclude", "exc": "exclude", "0": "exclude", "n": "exclude", "no": "exclude", "排除": "exclude",
@@ -233,6 +321,14 @@ _DECISION_ALIASES: dict[str, str] = {
 
 
 def round_label(round_no: int) -> str:
+    """把轮次编号映射为中文表头标签。
+
+    参数:
+        round_no: 轮次编号；1=初筛，2=复筛，其余显示"第{n}轮"。
+
+    返回:
+        对应的中文轮次标签。
+    """
     if round_no == 1:
         return "初筛"
     if round_no == 2:
@@ -241,7 +337,17 @@ def round_label(round_no: int) -> str:
 
 
 def normalize_decision(raw: str) -> str:
-    """中英文/缩写/数字都接受；无法识别返回空串（调用方按未填写处理）。"""
+    """把人工/LLM 填写的原始决策文本规范化为标准决策值。
+
+    参数:
+        raw: 原始填写值；中英文（纳入/排除/待定）、缩写（inc/exc/unc）、
+            数字（1/0）与符号（?/？）均接受。
+
+    返回:
+        规范化后的 include/exclude/uncertain；无法识别时返回空串，
+        调用方按未填写处理。
+    """
+    # 去空白 + 转小写后查别名表，实现中英文/缩写/数字的统一归一
     return _DECISION_ALIASES.get((raw or "").strip().lower(), "")
 
 
@@ -273,6 +379,14 @@ def _norm_key(s: str) -> str:
 
 
 def _norm_doi_key(s: str) -> str:
+    """归一化 DOI：转小写并剥掉常见 URL 前缀，便于跨格式比较。
+
+    参数:
+        s: 原始 DOI 字符串，可为空或带前缀。
+
+    返回:
+        去掉 https://doi.org/ 等前缀并转小写后的 DOI。
+    """
     out: str = (s or "").strip().lower()
     for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"):
         if out.startswith(prefix):
@@ -282,12 +396,23 @@ def _norm_doi_key(s: str) -> str:
 
 
 def pick_column(header: list[str], keyword: str, label: str) -> int:
-    """优先取带本轮标签的列（如"复筛决策"），否则退回首个含关键词的列。"""
+    """在 CSV 表头中挑目标列：先找同时含关键词与本轮标签的列，再回退到首个含关键词的列。
+
+    参数:
+        header: CSV 表头列名列表。
+        keyword: 目标关键词，如"决策"或"理由"。
+        label: 本轮标签，如"初筛"或"复筛"，用于区分多轮次的列。
+
+    返回:
+        列下标；两轮都没找到时返回 -1。
+    """
     i: int
     h: str
+    # 第一轮：找"复筛决策"这类同时带关键词和轮次标签的精确列，避免误取上一轮
     for i, h in enumerate(header):
         if keyword in (h or "") and label in (h or ""):
             return i
+    # 第二轮：回退到首个只含关键词的列（兼容只有单轮次表头的旧表）
     for i, h in enumerate(header):
         if keyword in (h or ""):
             return i
@@ -295,8 +420,22 @@ def pick_column(header: list[str], keyword: str, label: str) -> int:
 
 
 def apply_decision(paper: dict[str, Any], round_no: int, value: str, reason: str) -> None:
-    """写入 decision，保留其它轮次字段（先 apply round1 再 apply round2 不互相覆盖）。"""
+    """把本轮审查决策写回文献记录，且不影响其它轮次。
+
+    参数:
+        paper: 待更新的文献字典，原地修改。
+        round_no: 轮次编号；1 写入 round1/reason，>=2 写入 round{n}/reason{n}。
+        value: 规范化后的决策值（include/exclude/uncertain）。
+        reason: 决策理由，可为空串。
+
+    返回:
+        None。
+
+    异常:
+        无显式抛出。
+    """
     old: Any = paper.get("decision")
+    # 拷贝旧 decision 而不是原地改，保证多轮次回填互不覆盖
     dec: dict[str, Any] = dict(old) if isinstance(old, dict) else {}
     if not isinstance(old, dict) and old:
         dec = {"round1": str(old)}
@@ -320,15 +459,28 @@ def find_paper(
     by_doi: dict[str, dict[str, Any]],
     by_title: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """按 PMID > DOI > 标题 的顺序匹配回原 paper。"""
+    """把审查表的一行按 PMID > DOI > 标题 的顺序匹配回原 paper。
+
+    参数:
+        row: 审查表当前行（列名 -> 单元格文本）。
+        header: 审查表表头列名列表。
+        by_pmid: PMID -> paper 的索引。
+        by_doi: 归一化 DOI -> paper 的索引。
+        by_title: 归一化标题 -> paper 的索引。
+
+    返回:
+        匹配到的 paper；三级都未命中时返回 None。
+    """
     val: str = ""
     h: str
+    # 第一级：PMID 最可靠，取表头中首个含 PMID 的列来查
     for h in header:
         if h and "PMID" in h.upper():
             val = (row.get(h) or "").strip()
             break
     if val and val in by_pmid:
         return by_pmid[val]
+    # 第二级：DOI 匹配前先归一化，兼容 https://doi.org/ 等前缀差异
     for h in header:
         if h and "DOI" in h.upper():
             val = (row.get(h) or "").strip()
@@ -336,6 +488,7 @@ def find_paper(
     key: str = _norm_doi_key(val)
     if key and key in by_doi:
         return by_doi[key]
+    # 第三级：标题兜底；归一化后全文相等才算命中，避免误配
     for h in header:
         if h and "题目" in h:
             val = (row.get(h) or "").strip()
@@ -347,6 +500,14 @@ def find_paper(
 
 
 def main_prepare(argv: list[str]) -> int:
+    """执行 prepare 子命令：生成决策/理由留空的 CSV 审查表。
+
+    参数:
+        argv: 命令行参数列表（不含脚本名与子命令名）。
+
+    返回:
+        退出码；0 成功，1 表示输入中无论文。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(
         description="生成待填写的审查表 CSV（决策/理由列留空）"
     )
@@ -366,6 +527,14 @@ def main_prepare(argv: list[str]) -> int:
 
 
 def main_apply(argv: list[str]) -> int:
+    """执行 apply 子命令：把填好的审查表 CSV 回填为带 decision 的 JSON。
+
+    参数:
+        argv: 命令行参数列表（不含脚本名与子命令名）。
+
+    返回:
+        退出码；0 成功，2 表示审查表中找不到决策列。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(
         description="把填写好的审查表 CSV 回填为带 decision 的 JSON"
     )

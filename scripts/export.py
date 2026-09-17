@@ -28,11 +28,13 @@ from xml.sax.saxutils import escape as xml_escape
 # 通用工具
 # ---------------------------------------------------------------------------
 
+# csv/xlsx --fields 可选字段全集（顺序即默认展示顺序）
 FIELDS: list[str] = [
     "title", "authors", "journal", "date", "abstract", "keywords", "mesh",
     "pub_types", "volume", "issue", "pages", "pmid", "doi", "pmc", "arxiv", "url",
 ]
 
+# 各字段对应的中文表头标签（csv/xlsx 首行）
 FIELD_LABELS: dict[str, str] = {
     "title": "题目", "authors": "作者", "journal": "期刊", "date": "发表日期",
     "abstract": "摘要", "keywords": "关键词", "mesh": "MeSH主题词",
@@ -40,6 +42,7 @@ FIELD_LABELS: dict[str, str] = {
     "pmid": "PMID", "doi": "DOI", "pmc": "PMC编号", "arxiv": "arXiv编号", "url": "网址",
 }
 
+# 各 ID 字段对应的落地页 URL 构造器（pmid/doi/pmc/arxiv -> 可点击链接）
 ID_URL: dict[str, Callable[[str], str]] = {
     "pmid": lambda v: f"https://pubmed.ncbi.nlm.nih.gov/{v}/",
     "doi": lambda v: f"https://doi.org/{v}",
@@ -49,6 +52,17 @@ ID_URL: dict[str, Callable[[str], str]] = {
 
 
 def load_papers(path: str) -> list[dict[str, Any]]:
+    """加载 JSON 文件并取出论文数组。
+
+    参数:
+        path: JSON 文件路径。支持纯数组，或含 papers/included/results 键的对象。
+
+    返回:
+        论文字典列表。
+
+    异常:
+        ValueError: JSON 中找不到论文数组。
+    """
     data: list[dict[str, Any]] | dict[str, Any] | Any
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -63,6 +77,16 @@ def load_papers(path: str) -> list[dict[str, Any]]:
 def filter_ids(
     papers: list[dict[str, Any]], ids: str | None, exclude: str | None
 ) -> list[dict[str, Any]]:
+    """按 PMID 白名单/黑名单过滤论文列表。
+
+    参数:
+        papers: 待过滤的论文列表。
+        ids: 逗号分隔的 PMID 白名单；None 或空串表示不过滤。
+        exclude: 逗号分隔的 PMID 黑名单；None 或空串表示不排除。
+
+    返回:
+        过滤后的论文列表。
+    """
     if ids:
         keep: set[str] = {x.strip() for x in ids.split(",") if x.strip()}
         papers = [p for p in papers if str(p.get("pmid", "")) in keep]
@@ -73,40 +97,88 @@ def filter_ids(
 
 
 def expand_pages(pages: str) -> tuple[str, str]:
-    """MEDLINE 缩写页码展开：'568-74' -> ('568','574')；无法解析返回原样。"""
+    """把 MEDLINE 缩写页码展开成完整起止页。
+
+    参数:
+        pages: MEDLINE 页码字段，形如 '568-74'；空串或无法解析时原样返回。
+
+    返回:
+        (起始页, 结束页)；无法解析时返回 (原串, "")。
+
+    异常:
+        无显式抛出。
+    """
     m: re.Match[str] | None = re.match(r"^(\d+)\s*-\s*(\d+)$", pages or "")
     if not m:
         return pages or "", ""
     start: str = m.group(1)
     end: str = m.group(2)
     if len(end) < len(start):
+        # 末段位数不足时，用起始页的高位前缀补位：'568-74' -> '568' + '574'
         end = start[: len(start) - len(end)] + end
     return start, end
 
 
 def page_range(pages: str, dash: str = "-") -> str:
+    """把页码字段格式化为 '起-止' 字符串。
+
+    参数:
+        pages: 原始页码字段（可能为缩写形式）。
+        dash: 连接符，BibTeX 场景传 '--'。
+
+    返回:
+        '568-574'；无结束页时只返回起始页。
+    """
     sp, ep = expand_pages(pages)
     return f"{sp}{dash}{ep}" if ep else sp
 
 
 def year_of(p: dict[str, Any]) -> str:
+    """取论文发表年份（date 字段前 4 位）。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        年份字符串；date 缺失或不足 4 位时返回截断结果或空串。
+    """
     return (p.get("date") or "")[:4]
 
 
 def parse_author(fau: str) -> tuple[str, str]:
-    """'Voors, Adriaan A' -> ('Voors', 'Adriaan A')；无逗号按 'Last FM' 缩写式处理。"""
+    """解析作者姓名字段为 (姓, 名)。
+
+    参数:
+        fau: 作者名字符串。支持两种格式：
+            逗号式 'Voors, Adriaan A'（MEDLINE FAU 风格）；
+            'Last FM' 缩写式 'Voors AA'。
+
+    返回:
+        (姓, 名)。缩写式时名为无点缩写；均无法识别时返回 (原串, "")。
+    """
     fau = (fau or "").strip()
     if "," in fau:
+        # 逗号式：'Last, Given...'，逗号后整体作为名
         last, given = fau.split(",", 1)
         return last.strip(), given.strip()
     parts: list[str] = fau.split()
     if len(parts) >= 2 and re.fullmatch(r"[A-Z]{1,4}", parts[-1]):
+        # 'Last FM' 缩写式：末段是全大写缩写（1-4 字母），前面各段合并为姓
         return " ".join(parts[:-1]), parts[-1]
     return fau, ""
 
 
 def initials_of(given: str, dot: bool = True, space: bool = False) -> str:
-    """'Adriaan A' -> 'A. A.' / 'AA' / 'A A' 等。连字符名取两段首字母。"""
+    """把名字段转换为缩写首字母。
+
+    参数:
+        given: 名，如 'Adriaan A'；已是大写缩写（1-4 字母）时逐字母拆开。
+        dot: 每个首字母后加点。
+        space: 字母间加空格（'A. A.'），否则紧凑（'A.A.'）。
+
+    返回:
+        缩写串，如 'AA' / 'A.A.' / 'A. A.'；空输入返回空串。
+    """
     if not given:
         return ""
     letters: list[str]
@@ -119,6 +191,7 @@ def initials_of(given: str, dot: bool = True, space: bool = False) -> str:
             if not tok:
                 continue
             hy: list[str] = tok.split("-")
+            # 连字符名（如 Anne-Marie）取两段各自首字母，以 '-' 连接：'A-M'
             letters.append("-".join(seg[0].upper() for seg in hy if seg))
     sep: str = ". " if (dot and space) else ("." if dot else "")
     out: str = sep.join(letters)
@@ -126,12 +199,27 @@ def initials_of(given: str, dot: bool = True, space: bool = False) -> str:
 
 
 def author_list(p: dict[str, Any]) -> list[tuple[str, str]]:
+    """取论文作者列表并解析为 (姓, 名) 元组。
+
+    参数:
+        p: 论文字典。优先用全名 'authors'，缺失时回退 'authors_abbr'。
+
+    返回:
+        (姓, 名) 元组列表；无作者时为空列表。
+    """
     src: list[str] | Any = p.get("authors") or p.get("authors_abbr") or []
     return [parse_author(a) for a in src]
 
 
 def vancouver_names(p: dict[str, Any]) -> list[str]:
-    """'Voors AA' 风格（姓 + 无点缩写）。"""
+    """生成 'Voors AA' 风格作者名（姓 + 无点缩写）。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        每个作者一个 '姓 缩写' 字符串列表。
+    """
     out: list[str] = []
     last: str
     given: str
@@ -143,10 +231,27 @@ def vancouver_names(p: dict[str, Any]) -> list[str]:
 
 
 def doi_url(p: dict[str, Any]) -> str:
+    """优先返回 DOI 链接，无 DOI 时回退到论文自带 url。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        可访问的 URL 字符串；两者皆无返回空串。
+    """
     return f"https://doi.org/{p['doi']}" if p.get("doi") else p.get("url", "")
 
 
 def best_url(p: dict[str, Any], pref: str = "auto") -> str:
+    """为论文挑选最佳落地页 URL。
+
+    参数:
+        p: 论文字典。
+        pref: 优先 ID 类型；'auto' 时按 doi > pmc > pmid > arxiv 顺序取第一个可用值。
+
+    返回:
+        构造出的 URL；无任何 ID 时返回空串。
+    """
     if pref != "auto" and p.get(pref):
         return ID_URL[pref](p[pref])
     for k in ("doi", "pmc", "pmid", "arxiv"):
@@ -161,6 +266,14 @@ def best_url(p: dict[str, Any], pref: str = "auto") -> str:
 
 
 def cite_apa(p: dict[str, Any]) -> str:
+    """生成 APA 第 7 版格式引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 APA 引用字符串。
+    """
     au: list[tuple[str, str]] = author_list(p)
     names: list[str] = [
         f"{last}, {initials_of(given, dot=True, space=True)}".rstrip(", ")
@@ -187,6 +300,14 @@ def cite_apa(p: dict[str, Any]) -> str:
 
 
 def cite_harvard(p: dict[str, Any]) -> str:
+    """生成 Harvard（author-date）格式引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 Harvard 引用字符串。
+    """
     names: list[str] = []
     last: str
     given: str
@@ -215,6 +336,14 @@ def cite_harvard(p: dict[str, Any]) -> str:
 
 
 def cite_mla(p: dict[str, Any]) -> str:
+    """生成 MLA 第 9 版格式引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 MLA 引用字符串。
+    """
     au: list[tuple[str, str]] = author_list(p)
     astr: str
     if not au:
@@ -238,6 +367,14 @@ def cite_mla(p: dict[str, Any]) -> str:
 
 
 def cite_chicago(p: dict[str, Any]) -> str:
+    """生成 Chicago（author-date）格式引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 Chicago 引用字符串。
+    """
     au: list[tuple[str, str]] = author_list(p)
     astr: str
     if not au:
@@ -266,6 +403,14 @@ def cite_chicago(p: dict[str, Any]) -> str:
 
 
 def cite_ieee(p: dict[str, Any]) -> str:
+    """生成 IEEE 格式引用（期刊缩写优先）。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 IEEE 引用字符串。
+    """
     names: list[str] = []
     last: str
     given: str
@@ -296,6 +441,14 @@ def cite_ieee(p: dict[str, Any]) -> str:
 
 
 def cite_vancouver(p: dict[str, Any]) -> str:
+    """生成 Vancouver（ICMJE）格式引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 Vancouver 引用字符串。
+    """
     names: list[str] = vancouver_names(p)
     astr: str
     if len(names) > 6:
@@ -313,6 +466,14 @@ def cite_vancouver(p: dict[str, Any]) -> str:
 
 
 def cite_gbt7714(p: dict[str, Any]) -> str:
+    """生成 GB/T 7714-2015 顺序编码制引用。
+
+    参数:
+        p: 论文字典。
+
+    返回:
+        单条 GB/T 7714 引用字符串。
+    """
     names: list[str] = vancouver_names(p)
     # 西文文献：姓全称 + 名缩写（GB/T 7714-2015）；超过 3 位用 et al.
     astr: str
@@ -333,6 +494,7 @@ def cite_gbt7714(p: dict[str, Any]) -> str:
     return s
 
 
+# 引用格式注册表：格式名 -> (引用生成函数, 序号前缀模板)；"{n}" 为条目序号占位
 CITERS: dict[str, tuple[Callable[[dict[str, Any]], str], str]] = {
     "apa": (cite_apa, ""),
     "harvard": (cite_harvard, ""),
@@ -345,6 +507,16 @@ CITERS: dict[str, tuple[Callable[[dict[str, Any]], str], str]] = {
 
 
 def write_citations(papers: list[dict[str, Any]], fmt: str, out: str) -> None:
+    """按指定引用格式批量生成引用并写入文本文件。
+
+    参数:
+        papers: 论文列表。
+        fmt: 引用格式名，须为 CITERS 的键。
+        out: 输出文件路径，条目间空行分隔。
+
+    返回:
+        无。
+    """
     fn: Callable[[dict[str, Any]], str]
     prefix: str
     fn, prefix = CITERS[fmt]
@@ -364,6 +536,15 @@ def write_citations(papers: list[dict[str, Any]], fmt: str, out: str) -> None:
 
 
 def write_ris(papers: list[dict[str, Any]], out: str) -> None:
+    """导出 RIS（TY - JOUR）格式，供 EndNote/Zotero 等导入。
+
+    参数:
+        papers: 论文列表。
+        out: 输出文件路径，条目间空行分隔。
+
+    返回:
+        无。
+    """
     blocks: list[str] = []
     p: dict[str, Any]
     for p in papers:
@@ -410,14 +591,34 @@ def write_ris(papers: list[dict[str, Any]], out: str) -> None:
         f.write("\n\n".join(blocks) + "\n")
 
 
+# BibTeX 值中需要转义的特殊字符
 _BIB_SPECIAL: re.Pattern[str] = re.compile(r"[&%$#_{}]")
 
 
 def _bib_escape(s: str) -> str:
+    """对 BibTeX 值中的特殊字符加反斜杠转义。
+
+    参数:
+        s: 原始字符串；None 视为空串。
+
+    返回:
+        转义后的字符串。
+    """
     return _BIB_SPECIAL.sub(r"\\\1", s or "")
 
 
 def write_bibtex(papers: list[dict[str, Any]], out: str) -> None:
+    """导出 BibTeX（@article）格式。
+
+    引用键为 '第一作者姓+年份+首词'，如 'voors2024effects'。
+
+    参数:
+        papers: 论文列表。
+        out: 输出文件路径，条目间空行分隔。
+
+    返回:
+        无。
+    """
     entries: list[str] = []
     p: dict[str, Any]
     for p in papers:
@@ -458,10 +659,27 @@ def write_bibtex(papers: list[dict[str, Any]], out: str) -> None:
 
 
 def _en_style(text: str) -> str:
+    """把文本包装为 EndNote XML 的 style 节点并转义。
+
+    参数:
+        text: 原始文本。
+
+    返回:
+        '<style ...>转义文本</style>' 字符串。
+    """
     return f'<style face="normal" font="default" size="100%">{xml_escape(text)}</style>'
 
 
 def write_endnote_xml(papers: list[dict[str, Any]], out: str) -> None:
+    """导出 EndNote XML（.enw 系）格式。
+
+    参数:
+        papers: 论文列表，每篇一个 <record>。
+        out: 输出文件路径。
+
+    返回:
+        无。
+    """
     recs: list[str] = []
     p: dict[str, Any]
     for p in papers:
@@ -516,7 +734,15 @@ def write_endnote_xml(papers: list[dict[str, Any]], out: str) -> None:
 
 
 def write_medline(papers: list[dict[str, Any]], out: str) -> None:
-    """PubMed/MEDLINE 格式：优先输出抓取时保存的原始文本，缺失时按字段重建。"""
+    """导出 PubMed/MEDLINE 格式。
+
+    参数:
+        papers: 论文列表。优先输出抓取时保存的原始文本，缺失时按字段重建。
+        out: 输出文件路径，条目间空行分隔。
+
+    返回:
+        无。
+    """
     blocks: list[str] = []
     p: dict[str, Any]
     for p in papers:
@@ -564,6 +790,15 @@ def write_medline(papers: list[dict[str, Any]], out: str) -> None:
 
 
 def cell_value(p: dict[str, Any], field: str) -> str:
+    """取论文某字段的单元格字符串表示。
+
+    参数:
+        p: 论文字典。
+        field: FIELDS 中的字段名；列表型字段用 '; ' 连接并去掉 MeSH 的 '*' 前缀。
+
+    返回:
+        单元格字符串值。
+    """
     if field in ("keywords", "mesh", "pub_types"):
         vals: list[str] | Any = p.get({"keywords": "keywords", "mesh": "mesh_terms", "pub_types": "pub_types"}[field]) or []
         return "; ".join(v.lstrip("*") for v in vals)
@@ -575,6 +810,16 @@ def cell_value(p: dict[str, Any], field: str) -> str:
 
 
 def write_csv_file(papers: list[dict[str, Any]], fields: list[str], out: str) -> None:
+    """导出 CSV（utf-8-sig，Excel 直接打开不乱码）。
+
+    参数:
+        papers: 论文列表。
+        fields: 导出字段序列，决定列顺序。
+        out: 输出文件路径。
+
+    返回:
+        无。
+    """
     with open(out, "w", encoding="utf-8-sig", newline="") as f:
         w: Any = csv.writer(f)
         w.writerow([FIELD_LABELS[f] for f in fields])
@@ -586,6 +831,20 @@ def write_csv_file(papers: list[dict[str, Any]], fields: list[str], out: str) ->
 def write_xlsx_file(
     papers: list[dict[str, Any]], fields: list[str], out: str, url_source: str
 ) -> None:
+    """导出 XLSX：首行加粗冻结，ID 列自动挂超链接。
+
+    参数:
+        papers: 论文列表。
+        fields: 导出字段序列，决定列顺序。
+        out: 输出文件路径。
+        url_source: url 列取值优先级（auto 按 doi>pmc>pmid>arxiv）。
+
+    返回:
+        无。
+
+    异常:
+        SystemExit: 缺少 openpyxl 时退出码 2。
+    """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font
@@ -614,8 +873,10 @@ def write_xlsx_file(
             cell = ws.cell(row=r, column=c, value=val)
             link: str = ""
             if f in ID_URL and val:
+                # ID 列（pmid/doi/pmc/arxiv）：按类型构造落地页并挂超链接
                 link = ID_URL[f](val)
             elif f == "url":
+                # url 列：无原始值时回退 best_url 取最优落地页替换显示
                 link = best_url(p, url_source)
                 cell.value = link or val
             if link:
@@ -638,6 +899,14 @@ def write_xlsx_file(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口：解析参数并按格式分发导出。
+
+    参数:
+        argv: 参数列表；None 时取 sys.argv。
+
+    返回:
+        0 成功；1 筛选后无论文；2 字段名非法或缺少 openpyxl。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(
         description="文献导出器（RIS/BibTeX/EndNote/MEDLINE/引用格式/CSV/XLSX）"
     )

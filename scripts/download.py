@@ -11,37 +11,67 @@ download.py — 开放获取（OA）原文下载
 产物：
   <outdir>/<PMID>_<标题slug>.pdf （或 .tgz）
   <outdir>/manifest.json  每篇状态：downloaded / not_oa / error
+
+IO 模型（v1.6 起协程化）：每篇下载作为一个 asyncio.Task，asyncio.Semaphore 限制
+在途下载数（MAX_DOWNLOAD_CONCURRENCY=2），阻塞式下载在线程池执行
+（asyncio.to_thread），模块级 3 req/s 限流加锁后跨线程生效。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import IO, Any
 
+# HTTP 请求 User-Agent，便于 NCBI 识别工具来源
 USER_AGENT: str = "workbuddy-medlit-skill/1.0 (PMC OA download)"
+# PMC OA 服务：按 PMCID 查 PDF/tgz 下载链接
 OA_FCGI: str = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+# ID 转换服务：PMID -> PMCID
 IDCONV: str = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 
+# 在途全文下载并发上限（带宽友好；限流器仍保证总请求 ≤3 req/s）
+MAX_DOWNLOAD_CONCURRENCY: int = 2
+
+# 限流时钟：下一次允许发起请求的 monotonic 时间戳
 _next: float = 0.0
+# 并发下载时多个线程会同时经过 _wait，检查-推进必须加锁，否则限流失效
+_WAIT_LOCK: threading.Lock = threading.Lock()
 
 
 def _wait() -> None:
+    """按 3 req/s 限流，必要时睡眠等待（加锁版，供线程池内的阻塞请求共用）。"""
     global _next
-    now: float = time.monotonic()
-    if now < _next:
-        time.sleep(_next - now)
-    _next = time.monotonic() + 1.0 / 3.0  # 3 req/s
+    with _WAIT_LOCK:
+        now: float = time.monotonic()
+        if now < _next:
+            time.sleep(_next - now)
+        _next = time.monotonic() + 1.0 / 3.0  # 3 req/s
 
 
 def http_get(url: str, timeout: int = 120, retries: int = 3) -> bytes:
+    """发起 GET 请求并返回响应字节，带限流与指数退避重试。
+
+    参数:
+        url: 请求 URL。
+        timeout: 单次超时秒数。
+        retries: 最大尝试次数。
+
+    返回:
+        响应体字节。
+
+    异常:
+        RuntimeError: 全部重试均失败。
+    """
     last: Exception | None = None
     req: urllib.request.Request
     for attempt in range(retries):
@@ -57,12 +87,31 @@ def http_get(url: str, timeout: int = 120, retries: int = 3) -> bytes:
 
 
 def slugify(text: str, n: int = 40) -> str:
+    """把标题转成文件名安全 slug。
+
+    参数:
+        text: 原始标题。
+        n: 最大长度，超出截断。
+
+    返回:
+        仅含字母数字下划线的 slug；空结果回退 'untitled'。
+    """
     s: str = re.sub(r"[^\w\s-]", "", text or "", flags=re.UNICODE)
     s = re.sub(r"[\s-]+", "_", s).strip("_")
     return s[:n] or "untitled"
 
 
 def pmid_to_pmcid(pmid: str, email: str | None, api_key: str | None) -> str:
+    """经 idconv API 把 PMID 转成 PMCID。
+
+    参数:
+        pmid: PubMed ID。
+        email: 联系邮箱（可选，NCBI 建议提供）。
+        api_key: NCBI API key（可选）。
+
+    返回:
+        PMCID 字符串；转换失败或无 PMCID 时返回空串。
+    """
     params: dict[str, str] = {"ids": pmid, "format": "json", "tool": "workbuddy_medlit"}
     if email:
         params["email"] = email
@@ -81,7 +130,16 @@ def pmid_to_pmcid(pmid: str, email: str | None, api_key: str | None) -> str:
 
 
 def oa_links(pmcid: str, email: str | None, api_key: str | None) -> dict[str, str]:
-    """oa.fcgi -> {'pdf': url, 'tgz': url}；非 OA 返回空 dict。"""
+    """经 oa.fcgi 查询 PMCID 的 OA 下载链接。
+
+    参数:
+        pmcid: PMC 编号。
+        email: 联系邮箱（可选）。
+        api_key: NCBI API key（可选）。
+
+    返回:
+        {'pdf': url, 'tgz': url}；非 OA 或查询失败返回空 dict。
+    """
     params: dict[str, str] = {"id": pmcid}
     if email:
         params["email"] = email
@@ -110,10 +168,18 @@ def oa_links(pmcid: str, email: str | None, api_key: str | None) -> dict[str, st
 
 
 def candidate_urls(href: str) -> list[str]:
-    """oa.fcgi 返回 ftp:// 链接；生成按优先级排序的候选 URL。
+    """把 oa.fcgi 返回的 ftp:// 链接展开为按优先级排序的候选 URL。
 
-    背景（2026-04 NCBI 调整）：/pub/pmc/ 下的 oa_package、oa_pdf 等已迁入
-    /pub/pmc/deprecated/（2026-08 后旧路径将彻底下线）。故 deprecated 路径优先。
+    迁移适配背景（2026-04 NCBI 调整）：/pub/pmc/ 下的 oa_package、oa_pdf、
+    oa_bulk 已迁入 /pub/pmc/deprecated/（2026-08 后旧路径彻底下线），
+    因此 deprecated 路径作为第一候选优先尝试。
+
+    参数:
+        href: oa.fcgi 给出的原始链接（通常 ftp://）。
+
+    返回:
+        候选 URL 列表：deprecated https > 原路径 https > 原始 ftp 兜底；
+        非 NCBI ftp 链接时原样返回单元素列表。
     """
     cands: list[str] = []
     if href.startswith("ftp://ftp.ncbi.nlm.nih.gov/"):
@@ -122,6 +188,7 @@ def candidate_urls(href: str) -> list[str]:
         legacy_dir: str
         for legacy_dir in ("pub/pmc/oa_package/", "pub/pmc/oa_pdf/", "pub/pmc/oa_bulk/"):
             if legacy_dir in path:
+                # 旧目录映射到 deprecated/<类别>/，命中一个即停止（目录互斥）
                 dep: str = path.replace(legacy_dir, "pub/pmc/deprecated/" + legacy_dir.split("/", 2)[-1], 1)
                 cands.append("https://ftp.ncbi.nlm.nih.gov/" + dep)
                 break
@@ -133,6 +200,18 @@ def candidate_urls(href: str) -> list[str]:
 
 
 def fetch_first(cands: list[str], timeout: int = 300) -> tuple[bytes, str]:
+    """按顺序尝试候选 URL，返回第一个成功的响应。
+
+    参数:
+        cands: 候选 URL 列表。
+        timeout: 单次请求超时秒数。
+
+    返回:
+        (响应字节, 实际命中的 URL)。
+
+    异常:
+        RuntimeError: 全部候选均失败。
+    """
     last: Exception | None = None
     url: str
     for url in cands:
@@ -144,7 +223,19 @@ def fetch_first(cands: list[str], timeout: int = 300) -> tuple[bytes, str]:
 
 
 def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
-    """OA tgz 内通常含 <article>.pdf（及 XML/图片）；抽出 PDF 便于直接阅读。"""
+    """从 OA tgz 包中抽出 PDF 单独落盘。
+
+    OA tgz 内通常含 <article>.pdf 及 XML/图片；只取第一个 PDF 成员，
+    以 base 命名写到 outdir，便于直接阅读。
+
+    参数:
+        tgz_path: tgz 包路径。
+        outdir: PDF 输出目录。
+        base: 输出文件名（不含扩展名）。
+
+    返回:
+        抽出的 PDF 路径；失败返回空串（原始 tgz 保留）。
+    """
     import tarfile
 
     member: tarfile.TarInfo
@@ -153,6 +244,7 @@ def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
     try:
         with tarfile.open(tgz_path, "r:gz") as tar:
             for member in tar.getmembers():
+                # 只挑普通文件且以 .pdf 结尾的成员（大小写不敏感）
                 if member.isfile() and member.name.lower().endswith(".pdf"):
                     data = tar.extractfile(member)
                     if data is None:
@@ -168,6 +260,21 @@ def extract_pdf_from_tgz(tgz_path: str, outdir: str, base: str) -> str:
 
 
 def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key: str | None) -> dict[str, Any]:
+    """下载单篇论文的 OA 全文（状态机式流程）。
+
+    流程：取/换 PMCID -> oa.fcgi 查链接 -> 生成候选 URL 下载 ->
+    tgz 则解包抽 PDF；任一步不可达则记录状态与落地页。
+
+    参数:
+        paper: 论文字典（至少含 pmid；title/doi/url/pmc 可选）。
+        outdir: 文件保存目录。
+        email: 联系邮箱（可选）。
+        api_key: NCBI API key（可选）。
+
+    返回:
+        manifest 条目：pmid/title/status/file/message/landing_url；
+        status 取值 downloaded / not_oa / error。
+    """
     pmid: str = str(paper.get("pmid", ""))
     entry: dict[str, Any] = {
         "pmid": pmid,
@@ -177,6 +284,7 @@ def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key:
         "message": "",
         "landing_url": "",
     }
+    # 状态 1：拿到 PMCID（论文自带，或经 idconv 由 PMID 转换）；拿不到即非 OA
     pmcid: str = paper.get("pmc") or pmid_to_pmcid(pmid, email, api_key)
     if not pmcid:
         entry["status"] = "not_oa"
@@ -186,6 +294,7 @@ def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key:
         )
         return entry
 
+    # 状态 2：oa.fcgi 查 OA 链接，优先直链 PDF，否则取 tgz 包
     links: dict[str, str] = oa_links(pmcid, email, api_key)
     href: str = ""
     ext: str = ""
@@ -199,6 +308,7 @@ def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key:
         entry["landing_url"] = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
         return entry
 
+    # 状态 3：按候选优先级下载并落盘；tgz 再解包抽 PDF
     fname: str = f"{pmid}_{slugify(paper.get('title', ''))}{ext}"
     fpath: str = os.path.join(outdir, fname)
     try:
@@ -224,6 +334,17 @@ def download_one(paper: dict[str, Any], outdir: str, email: str | None, api_key:
 
 
 def load_papers(path: str) -> list[dict[str, Any]]:
+    """加载 JSON 文件并取出论文数组。
+
+    参数:
+        path: JSON 文件路径。支持纯数组，或含 papers/included/results 键的对象。
+
+    返回:
+        论文字典列表。
+
+    异常:
+        ValueError: JSON 中找不到论文数组。
+    """
     data: Any
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -236,7 +357,60 @@ def load_papers(path: str) -> list[dict[str, Any]]:
     raise ValueError("输入 JSON 中找不到论文数组")
 
 
+async def _run_all(papers: list[dict[str, Any]], outdir: str, email: str | None, api_key: str | None) -> tuple[list[dict[str, Any]], int]:
+    """并发执行全部下载任务并汇总 manifest。
+
+    每篇一个 asyncio.Task；信号量限制在途下载数，阻塞式 download_one
+    经 asyncio.to_thread 放入线程池执行，模块级限流（加锁）跨线程生效。
+
+    参数:
+        papers: 待下载论文列表。
+        outdir: 保存目录。
+        email: 联系邮箱（可选）。
+        api_key: NCBI API key（可选）。
+
+    返回:
+        (manifest 条目列表（与 papers 顺序一致）, 成功下载篇数)。
+    """
+    sem: asyncio.Semaphore = asyncio.Semaphore(MAX_DOWNLOAD_CONCURRENCY)
+    total: int = len(papers)
+
+    async def one(idx: int, paper: dict[str, Any]) -> dict[str, Any]:
+        """单篇下载任务。
+
+        参数:
+            idx: 论文序号（0 基，用于进度日志）。
+            paper: 论文字典。
+
+        返回:
+            该篇 manifest 条目。
+        """
+        async with sem:
+            entry: dict[str, Any] = await asyncio.to_thread(
+                download_one, paper, outdir, email, api_key
+            )
+            print(
+                f"[{idx + 1}/{total}] {entry['pmid']}: {entry['status']} {entry['message']}",
+                file=sys.stderr,
+            )
+            return entry
+
+    entries: list[dict[str, Any]] = await asyncio.gather(
+        *[one(i, p) for i, p in enumerate(papers)]
+    )
+    ok: int = sum(1 for e in entries if e["status"] == "downloaded")
+    return list(entries), ok
+
+
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口：协程并发下载并写 manifest.json。
+
+    参数:
+        argv: 参数列表；None 时取 sys.argv。
+
+    返回:
+        0 成功（含部分失败，详见 manifest）。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(description="PMC 开放获取原文下载")
     ap.add_argument("--input", required=True, help="pubmed.py 产出的 JSON / 筛选结果 JSON")
     ap.add_argument("--ids", default=None, help="只下载这些 PMID（逗号分隔），默认全部")
@@ -251,16 +425,9 @@ def main(argv: list[str] | None = None) -> int:
         papers = [p for p in papers if str(p.get("pmid", "")) in keep]
     os.makedirs(args.outdir, exist_ok=True)
 
-    manifest: list[dict[str, Any]] = []
-    ok: int = 0
-    i: int
-    p: dict[str, Any]
-    entry: dict[str, Any]
-    for i, p in enumerate(papers, 1):
-        entry = download_one(p, args.outdir, args.email, args.api_key)
-        manifest.append(entry)
-        ok += entry["status"] == "downloaded"
-        print(f"[{i}/{len(papers)}] {entry['pmid']}: {entry['status']} {entry['message']}", file=sys.stderr)
+    manifest: list[dict[str, Any]]
+    ok: int
+    manifest, ok = asyncio.run(_run_all(papers, args.outdir, args.email, args.api_key))
 
     mpath: str = os.path.join(args.outdir, "manifest.json")
     f3: IO[str]

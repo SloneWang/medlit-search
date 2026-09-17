@@ -34,14 +34,33 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pubmed import parse_medline, record_to_paper  # type: ignore
 
+# 统一文献记录类型：规范字段 + 任意自定义字段
 Paper = dict[str, Any]
 
 
 def _first(mapping: dict[str, list[str]], key: str) -> str:
+    """取多值映射中指定键的所有值并用空格拼接。
+
+    参数:
+        mapping: tag 到值列表的多值映射。
+        key: 待取值的键。
+
+    返回:
+        键存在时返回拼接字符串；不存在时返回 ""。
+    """
     return " ".join(mapping.get(key, [])) if key in mapping else ""
 
 
 def _all(mapping: dict[str, list[str]], key: str) -> list[str]:
+    """取多值映射中指定键的完整值列表。
+
+    参数:
+        mapping: tag 到值列表的多值映射。
+        key: 待取值的键。
+
+    返回:
+        键存在时值列表；不存在时空列表。
+    """
     return mapping.get(key, [])
 
 
@@ -49,27 +68,40 @@ def _all(mapping: dict[str, list[str]], key: str) -> list[str]:
 # RIS
 # ---------------------------------------------------------------------------
 
+# RIS 中表示期刊名的候选 tag（按集合内顺序依次尝试取首个命中）
 _RIS_JOURNAL_TAGS: set[str] = {"T2", "JF", "JA", "JO"}
+# RIS 中表示发表日期的候选 tag（导出工具不同，tag 各异）
 _RIS_DATE_TAGS: set[str] = {"PY", "DA", "Y1", "Y2"}
 
 
 def parse_ris(text: str) -> list[Paper]:
-    """解析 RIS 格式；每条记录以 TY 开始、ER 结束。"""
+    """解析 RIS 格式文本为规范 Paper 列表。
+
+    参数:
+        text: RIS 全文；每条记录以 TY 行开始、ER 行结束。
+
+    返回:
+        解析出的 Paper 列表，字段已映射到与 pubmed.py 一致的统一 Schema。
+    """
     records: list[dict[str, list[str]]] = []
     current: dict[str, list[str]] | None = None
 
+    # 逐行扫描：TY 开启新记录，ER 或无法解析的行结束当前记录
     for raw in text.splitlines():
         line: str = raw.strip()
+        # ER 是记录结束标记；不足 4 字符的行不可能容纳 "XX  - "，直接跳过
         if len(line) < 4 or line.startswith("ER"):
             current = None
             continue
+        # TY 行开启一条新记录，记录类型值从第 6 列起
         if line[:2] == "TY":
             current = {"TY": [line[6:].strip() if len(line) > 6 else ""]}
             records.append(current)
             continue
+        # TY 之前的内容（文件头注释等）不属于任何记录
         if current is None:
             continue
-        # tag 为前 2 个大写字母；值从第 6 列起
+        # tag 为前 2 个大写字母；值从第 6 列起（RIS 定界格式 "XX  - value"）
         tag: str = line[:2].upper()
         value: str = line[6:].strip() if len(line) > 6 else ""
         current.setdefault(tag, []).append(value)
@@ -128,6 +160,7 @@ def parse_ris(text: str) -> list[Paper]:
 # BibTeX
 # ---------------------------------------------------------------------------
 
+# 匹配 @type{citekey, body} 条目：body 惰性捕获到换行 + 收尾 } 为止
 _BIB_RE: re.Pattern[str] = re.compile(
     r"@\w+\s*\{\s*[^,]*,\s*(?P<body>.*?)\n\s*\}\s*$",
     re.DOTALL | re.MULTILINE,
@@ -135,7 +168,14 @@ _BIB_RE: re.Pattern[str] = re.compile(
 
 
 def _bib_unbrace(s: str) -> str:
-    """去掉 BibTeX 值最外层 {} 或 ""，不做 LaTeX 反斜杠展开。"""
+    """去掉 BibTeX 值最外层的 {} 或 "" 包裹。
+
+    参数:
+        s: 原始字段值字符串。
+
+    返回:
+        仅当首尾配对的 {} 或 "" 存在时剥离一层；不做 LaTeX 反斜杠展开。
+    """
     s = s.strip()
     if len(s) >= 2 and ((s[0] == "{" and s[-1] == "}") or (s[0] == '"' and s[-1] == '"')):
         s = s[1:-1].strip()
@@ -143,11 +183,20 @@ def _bib_unbrace(s: str) -> str:
 
 
 def _bib_split_body(body: str) -> dict[str, str]:
-    """按顶层逗号拆分字段；大括号可嵌套，引号内不拆分。"""
+    """把 BibTeX 条目体按顶层逗号拆成 字段名 → 值 映射。
+
+    参数:
+        body: 条目体文本（不含 @type{citekey, 前缀与收尾 }）。
+
+    返回:
+        字段名小写化后的映射；不含 "=" 的片段被忽略。
+    """
     fields: dict[str, str] = {}
     depth: int = 0
     in_quote: str | None = None
     start: int = 0
+    # 状态机：跟踪大括号嵌套深度（depth）与引号状态（in_quote），
+    # 只在 depth == 0 且不在引号内时才把逗号当作字段分隔符
     for i, ch in enumerate(body):
         if ch == "{":
             if not in_quote:
@@ -156,6 +205,7 @@ def _bib_split_body(body: str) -> dict[str, str]:
             if not in_quote:
                 depth -= 1
         elif ch in "\"'":
+            # 仅顶层引号参与状态切换，避免值内的嵌套引号干扰
             if depth == 0:
                 if in_quote is None:
                     in_quote = ch
@@ -169,6 +219,7 @@ def _bib_split_body(body: str) -> dict[str, str]:
                 k, v = part.split("=", 1)
                 fields[k.strip().lower()] = _bib_unbrace(v.strip())
             start = i + 1
+    # 收尾段无结尾逗号，需单独处理并去掉尾部逗号
     part = body[start:].strip().rstrip(",")
     if "=" in part:
         k, v = part.split("=", 1)
@@ -177,13 +228,28 @@ def _bib_split_body(body: str) -> dict[str, str]:
 
 
 def _bib_authors(raw: str) -> list[str]:
-    """BibTeX author: 'Voors, Adriaan A and Doe, John' -> ['Voors, Adriaan A', 'Doe, John']。"""
+    """把 BibTeX author 字段按 " and " 切分为作者列表。
+
+    参数:
+        raw: 原始 author 字段值，形如 'Voors, Adriaan A and Doe, John'。
+
+    返回:
+        去空白后的作者列表。
+    """
+    # BibTeX 约定用 and 分隔多位作者（忽略大小写）
     parts: list[str] = re.split(r"\s+and\s+", raw, flags=re.IGNORECASE)
     return [p.strip() for p in parts if p.strip()]
 
 
 def parse_bibtex(text: str) -> list[Paper]:
-    """简单 BibTeX 解析：支持 @article / @inproceedings 等，保留 abstract。"""
+    """简单 BibTeX 解析：支持 @article / @inproceedings 等常见条目，保留 abstract。
+
+    参数:
+        text: BibTeX 全文。
+
+    返回:
+        规范 Paper 列表；字段为空的条目也会被收录。
+    """
     papers: list[Paper] = []
     # 规范化条目边界：@xxx { ..., }
     text = re.sub(r"(\n\s*)+\}", "\n}", text)
@@ -245,6 +311,14 @@ def parse_bibtex(text: str) -> list[Paper]:
 # ---------------------------------------------------------------------------
 
 def parse_medline_import(text: str) -> list[Paper]:
+    """解析 MEDLINE 纯文本为规范 Paper 列表（复用 pubmed.py，避免重复实现）。
+
+    参数:
+        text: MEDLINE / PubMed nbib 全文。
+
+    返回:
+        规范 Paper 列表。
+    """
     records: list[list[tuple[str, str]]] = parse_medline(text)
     return [record_to_paper(r) for r in records]
 
@@ -253,10 +327,12 @@ def parse_medline_import(text: str) -> list[Paper]:
 # 统一记录结构（缺键补全）
 # ---------------------------------------------------------------------------
 
+# 规范字段：值为 str 的键（缺省时补 ""）
 CANON_STR_KEYS: tuple[str, ...] = (
     "pmid", "title", "date", "journal", "journal_abbr", "abstract",
     "volume", "issue", "pages", "language", "doi", "pmc", "arxiv", "pii", "url",
 )
+# 规范字段：值为 list 的键（缺省时补 []）
 CANON_LIST_KEYS: tuple[str, ...] = (
     "authors", "authors_abbr", "mesh_terms", "keywords", "pub_types",
 )
@@ -267,15 +343,25 @@ CANON_KEYS.update({k: [] for k in CANON_LIST_KEYS})
 
 
 def _normalize_paper(p: dict[str, Any]) -> Paper:
-    """补齐规范字段（str 缺为 ""，list 缺为 []），并保留额外字段；url 缺失时按 doi/pmid 生成。"""
+    """把任意来源的记录补齐为规范 Paper。
+
+    参数:
+        p: 原始记录 dict，可缺少部分规范字段，也可带有自定义字段。
+
+    返回:
+        补齐后的 Paper：str 字段缺为 "" 并去空白；list 字段缺为 [] 且去掉空项；
+        规范字段之外的自定义字段原样保留；url 缺失时按 doi / pmid 兜底生成。
+    """
     out: Paper = {}
     key: str
     val: Any
+    # str 字段：None 视为 ""，非 str 值强转后去空白
     for key in CANON_STR_KEYS:
         val = p.get(key, "")
         if val is None:
             val = ""
         out[key] = val.strip() if isinstance(val, str) else str(val)
+    # list 字段：list / tuple 逐项去空白去空项；单个 str 则按常见分隔符拆开
     for key in CANON_LIST_KEYS:
         raw: Any = p.get(key, [])
         items: list[str] = []
@@ -289,6 +375,7 @@ def _normalize_paper(p: dict[str, Any]) -> Paper:
     for extra_key, val in p.items():
         if extra_key not in out:
             out[extra_key] = val
+    # url 兜底生成：优先 DOI 链接，其次 PubMed 页面
     if not out.get("url"):
         if out.get("doi"):
             out["url"] = f"https://doi.org/{out['doi']}"
@@ -301,6 +388,7 @@ def _normalize_paper(p: dict[str, Any]) -> Paper:
 # 格式识别
 # ---------------------------------------------------------------------------
 
+# 扩展名（小写）→ 格式名 的直接映射表；命中即确定格式
 _EXT_FORMAT: dict[str, str] = {
     ".json": "json",
     ".jsonl": "json",
@@ -315,11 +403,19 @@ _EXT_FORMAT: dict[str, str] = {
     ".medline": "medline",
 }
 
+# 文本读取编码尝试顺序：优先带 BOM 的 UTF-8，兼容中文数据库常见的 GBK 系列
 _ENCODINGS: tuple[str, ...] = ("utf-8-sig", "utf-8", "gbk", "gb18030")
 
 
 def _read_text(path: str) -> str:
-    """按 utf-8-sig / utf-8 / gbk / gb18030 顺序容错读取文本。"""
+    """按编码优先级顺序容错读取文本文件。
+
+    参数:
+        path: 待读取文件路径。
+
+    返回:
+        首次解码成功的全文；全部失败时按 gb18030 + errors=replace 兜底，不抛异常。
+    """
     enc: str
     for enc in _ENCODINGS:
         try:
@@ -334,11 +430,21 @@ def _read_text(path: str) -> str:
 
 
 def detect_format(path: str) -> str:
-    """先按扩展名判断，扩展名不确定时用内容嗅探。"""
+    """识别文件格式：先按扩展名判断，扩展名不可靠时回退到内容嗅探。
+
+    参数:
+        path: 待识别文件路径。
+
+    返回:
+        格式名（json / ris / bibtex / medline / csv / xlsx）；
+        无法判断时默认返回 "medline"。
+    """
+    # 回退链第一级：扩展名直接命中映射表即可返回
     ext: str = os.path.splitext(path)[1].lower()
     if ext in _EXT_FORMAT:
         return _EXT_FORMAT[ext]
 
+    # 回退链第二级：读取前 8KB 内容做嗅探
     head: str = ""
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
@@ -349,6 +455,8 @@ def detect_format(path: str) -> str:
     sample: str = head.lstrip("\ufeff").lstrip()
     if not sample:
         return "medline"
+    # 依次按各格式的特征模式判断：JSON 大括号开头、RIS 的 "TY  - "、
+    # BibTeX 的 "@article{" 等条目、MEDLINE 的 "PMID  -" 固定宽 tag
     if sample.startswith("{"):
         return "json"
     if re.search(r"(?m)^\s*TY\s+-\s", sample):
@@ -358,6 +466,7 @@ def detect_format(path: str) -> str:
     if re.search(r"(?m)^(PMID|AU|TI|AB|DP|AID|JT)\s{2}-", sample):
         return "medline"
 
+    # 最后一级启发式：首行含逗号且前 5 行按 CSV 解析的列数一致 → 判定 CSV
     lines: list[str] = sample.splitlines()
     first: str = lines[0] if lines else ""
     if "," in first:
@@ -379,6 +488,7 @@ def detect_format(path: str) -> str:
 # CSV / XLSX：中英文表头兼容
 # ---------------------------------------------------------------------------
 
+# 规范字段名 → 各数据库导出的中英文表头别名列表
 COLUMN_ALIASES: dict[str, list[str]] = {
     "title": ["title", "题名", "篇名", "题目", "文献标题", "文献题名", "articletitle", "articlename", "文献名称"],
     "authors": ["authors", "author", "作者", "作者姓名", "著者", "全部作者", "creator"],
@@ -405,21 +515,39 @@ _HEADER_INDEX: dict[str, str] = {
     for alias in aliases
 }
 
+# 表头括号内容清除用（兼容中英文括号）
 _PAREN_RE: re.Pattern[str] = re.compile(r"[\(（][^)）]*[\)）]")
 
 
 def _map_header(header: str) -> str:
-    """表头归一化后匹配规范字段名，未匹配返回 ""。"""
+    """把原始表头归一化为规范字段名。
+
+    参数:
+        header: CSV / XLSX 首行的原始列名（可能带 BOM、括号注释、空白）。
+
+    返回:
+        匹配到的规范字段名；去 BOM、去括号、去空白并小写化后仍匹配不到则返回 ""。
+    """
+    # 归一化三步：去 BOM + 转小写去首尾空白 → 去括号内容 → 去全部内部空白
     name: str = (header or "").replace("\ufeff", "").strip().lower()
     name = _PAREN_RE.sub("", name)
     name = re.sub(r"\s+", "", name)
     if not name:
         return ""
+    # 查扁平索引；dict 后写覆盖先写，故同一别名映射到 COLUMN_ALIASES 中后出现的规范字段
     return _HEADER_INDEX.get(name, "")
 
 
 def _split_multi(raw: str, pattern: str) -> list[str]:
-    """按给定分隔集切分并去重保序。"""
+    """按正则分隔集切分字符串并去重保序。
+
+    参数:
+        raw: 待切分文本。
+        pattern: 传给 re.split 的分隔符正则。
+
+    返回:
+        去空白、去空项、去重且保持原顺序的列表。
+    """
     seen: set[str] = set()
     out: list[str] = []
     part: str
@@ -432,22 +560,42 @@ def _split_multi(raw: str, pattern: str) -> list[str]:
 
 
 def _split_authors(raw: str) -> list[str]:
-    """作者串切分：优先分号；无分号时才按逗号切，且切出的每段必须非空且长度 > 1。"""
+    """把作者单元格文本切分为作者列表。
+
+    参数:
+        raw: 作者字段原始文本，可能以中英文分号、逗号、顿号分隔多位作者。
+
+    返回:
+        作者列表；含分号时优先按分号切；纯逗号分隔时只接受长度 > 1 的段，
+        避免把 "姓, 名" 写法的单作者误切。
+    """
     text: str = (raw or "").strip()
     if not text:
         return []
     parts: list[str]
+    # 优先按中英文分号切：中文数据库（CNKI / 万方 / 维普）导出习惯用分号分隔作者
     if ";" in text or "；" in text:
         parts = re.split(r"[;；]+", text)
     else:
+        # 无分号才退回逗号 / 顿号；过短（长度 <= 1）的段多为缩写碎片，不算一位作者
         parts = [p for p in re.split(r"[,，、]+", text) if p.strip() and len(p.strip()) > 1]
         if len(parts) <= 1:
+            # 切不出多位作者时保留原文整体（可能是 "姓, 名" 单作者写法）
             parts = [text]
+    # 统一经分号分隔再过一遍 _split_multi：去空白、去重、保序
     return _split_multi(";".join(parts), r"[;；]")
 
 
 def _row_to_paper(row: dict[str, str]) -> Paper:
-    """一行表格数据（键为原始表头）→ 规范 Paper，csv / xlsx 共用。"""
+    """把一行表格数据（键为原始表头）组装为规范 Paper，csv / xlsx 共用。
+
+    参数:
+        row: 原始表头 → 单元格值 的映射。
+
+    返回:
+        经 _normalize_paper 规范化后的 Paper；同一规范字段被多个表头命中时取首个非空值。
+    """
+    # 第一步：原始表头 → 规范字段名，只保留首个非空值
     canon: dict[str, str] = {}
     raw_key: Any
     raw_val: Any
@@ -461,6 +609,7 @@ def _row_to_paper(row: dict[str, str]) -> Paper:
         if value and not canon.get(field):
             canon[field] = value
 
+    # 第二步：按规范字段名组装 Paper（list 字段就地切分），再走统一规范化
     authors: list[str] = _split_authors(canon.get("authors", ""))
     paper: Paper = {
         "pmid": canon.get("pmid", ""),
@@ -488,7 +637,14 @@ def _row_to_paper(row: dict[str, str]) -> Paper:
 
 
 def parse_csv(path: str) -> list[Paper]:
-    """解析 CNKI / 万方 / 维普 / Scopus / WoS 等导出的 CSV，编码自动容错。"""
+    """解析 CNKI / 万方 / 维普 / Scopus / WoS 等导出的 CSV。
+
+    参数:
+        path: CSV 文件路径；编码自动容错（UTF-8 / GBK 系列）。
+
+    返回:
+        规范 Paper 列表；完全为空的行被跳过。
+    """
     text: str = _read_text(path)
     reader: "csv.DictReader[str]" = csv.DictReader(io.StringIO(text, newline=""))
     papers: list[Paper] = []
@@ -507,7 +663,17 @@ def parse_csv(path: str) -> list[Paper]:
 
 
 def parse_xlsx(path: str) -> list[Paper]:
-    """解析 Excel 表格（取第一个 worksheet，首行当表头）。"""
+    """解析 Excel 表格（取第一个 worksheet，首行当表头）。
+
+    参数:
+        path: xlsx / xlsm 文件路径。
+
+    返回:
+        规范 Paper 列表。
+
+    异常:
+        RuntimeError: 未安装 openpyxl 时抛出，并附安装提示。
+    """
     try:
         import openpyxl  # type: ignore  # 延迟导入：非 xlsx 场景不依赖
     except ImportError as exc:
@@ -540,7 +706,15 @@ def parse_xlsx(path: str) -> list[Paper]:
 
 
 def load_json_papers(path: str) -> list[Paper]:
-    """读取统一 JSON（papers / included / results）或论文 dict 数组，并补齐规范字段。"""
+    """读取统一 JSON 或 JSONL 为规范 Paper 列表。
+
+    参数:
+        path: JSON 文件路径；支持本 skill 统一 JSON（papers / included / results 键）、
+            论文 dict 数组，以及 .jsonl 逐行格式。
+
+    返回:
+        逐条经 _normalize_paper 补齐的 Paper 列表。
+    """
     fh: io.TextIOWrapper
     with open(path, "r", encoding="utf-8-sig") as fh:
         text: str = fh.read()
@@ -577,7 +751,15 @@ def load_json_papers(path: str) -> list[Paper]:
 
 
 def _load_by_format(path: str, fmt: str) -> list[Paper]:
-    """按格式路由到对应解析器。"""
+    """按格式名把文件路由到对应解析器。
+
+    参数:
+        path: 输入文件路径。
+        fmt: 格式名（csv / json / xlsx / ris / bibtex / medline）。
+
+    返回:
+        解析出的 Paper 列表；medline 为其余格式的兜底。
+    """
     if fmt == "csv":
         return parse_csv(path)
     if fmt == "json":
@@ -595,6 +777,12 @@ def _load_by_format(path: str, fmt: str) -> list[Paper]:
 # ---------------------------------------------------------------------------
 
 def _dump(obj: Paper, out: str) -> None:
+    """把对象序列化为 JSON 并写到文件或 stdout。
+
+    参数:
+        obj: 待输出的 dict（含 ensure_ascii=False、缩进 2 的格式化 JSON）。
+        out: 输出路径；为 "-" 或空时写到 stdout。
+    """
     text: str = json.dumps(obj, ensure_ascii=False, indent=2)
     if out == "-" or not out:
         sys.stdout.write(text + "\n")
@@ -605,6 +793,14 @@ def _dump(obj: Paper, out: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口：识别格式、加载文献并写出统一 JSON。
+
+    参数:
+        argv: 命令行参数列表；None 时取 sys.argv。
+
+    返回:
+        进程退出码，成功为 0。
+    """
     ap: argparse.ArgumentParser = argparse.ArgumentParser(
         description="RIS / BibTeX / MEDLINE / JSON / CSV / XLSX 文献导入为统一 JSON",
     )
