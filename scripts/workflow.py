@@ -22,6 +22,9 @@ import os
 import sys
 from typing import Any, TextIO
 
+# 版本标识（与 SKILL.md 保持一致）
+__version__: str = 1.7
+
 # 复用 export.py 的字段标签与取值逻辑
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, FIELDS, cell_value  # type: ignore

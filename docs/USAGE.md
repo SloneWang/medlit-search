@@ -1,6 +1,8 @@
 # 使用文档 · medlit-search
 
-> 适用版本：v1.1 · 数据源：PubMed（NCBI E-utilities）；支持导入 RIS / BibTeX / MEDLINE
+> 适用版本：v1.7 · 数据源：PubMed（NCBI E-utilities）；支持导入 RIS / BibTeX / MEDLINE
+>
+> 用户使用流程与内部执行流程图见 [README.md](../README.md#用户使用流程)。
 
 ## 目录
 
@@ -17,20 +19,22 @@
 
 ## 1. 安装与前置条件
 
-**要求**：Python ≥ 3.10（3.13 已验证）。克隆或下载本仓库即可，无需安装。
+**要求**：Python ≥ 3.10（3.13 已验证）。
 
 ```bash
-git clone https://github.com/SloneWang/medlit-search.git
+git clone -b v1.7 https://github.com/SloneWang/medlit-search.git
 cd medlit-search
+pip install -r requirements.txt
 ```
 
 | 依赖 | 必要性 | 说明 |
 |---|---|---|
-| Python 标准库 | 必需 | 检索、解析、绝大多数导出格式只用标准库 |
-| `openpyxl` | 可选 | 仅 XLSX 导出需要：`pip install openpyxl` |
-| NCBI API key | 可选 | 免费申请，把限速从 3 req/s 提到 10 req/s。见 [FAQ](#6-faq) |
+| Python 标准库 | 必需 | 解析、筛选、多数导出格式 |
+| `aiohttp` | 必需 | 全部 HTTP 调用（PubMed / MeSH / Unpaywall / PMC OA） |
+| `openpyxl` | 可选 | 仅 XLSX 导出需要 |
+| NCBI API key | 可选 | 免费申请，限速 3 → 10 req/s |
 
-**网络**：需要能访问 `eutils.ncbi.nlm.nih.gov`、`id.nlm.nih.gov`、`www.ncbi.nlm.nih.gov`、`ftp.ncbi.nlm.nih.gov`。
+**网络**：需要能访问 `eutils.ncbi.nlm.nih.gov`、`id.nlm.nih.gov`、`www.ncbi.nlm.nih.gov`、`ftp.ncbi.nlm.nih.gov`、`api.unpaywall.org`。
 
 ---
 
@@ -41,21 +45,22 @@ cd medlit-search
 ```bash
 python scripts/pubmed.py search --query-file query.txt \
     [--query "..."] [--mindate 2020/01/01] [--maxdate 2026/12/31] \
-    [--retmax 100] [--batch 200] [--sort relevance] \
+    [--limit 100] [--batch 200] [--sort pub_date] \
     [--api-key KEY] [--email you@example.com] --out results.json
 ```
 
 | 参数 | 说明 |
 |---|---|
 | `--query` / `--query-file` | 二选一（必填）。PubMed 检索式；**推荐写文件**，避免 shell 引号/空格被拆 |
-| `--mindate` `--maxdate` | 发表日期过滤（`datetype=pdat`），格式 `YYYY` 或 `YYYY/MM/DD` |
-| `--retmax` | 最多拉取篇数；`0` = 全部命中（大结果集耗时长） |
+| `--mindate` `--maxdate` | 发表日期过滤（`datetype=pdat`），格式 `YYYY` 或 `YYYY/MM/DD`；**必须成对给** |
+| `--limit` | 最多拉取篇数；`0` = 全部命中（大结果集耗时长） |
 | `--batch` | efetch 每批篇数（默认 200，≤500） |
-| `--sort` | `relevance`（默认）/ `pub_date` |
+| `--sort` | `pub_date`（默认，发表日期降序）/ `relevance` / `most_recent` / `journal` / `title` |
 | `--api-key` | NCBI API key；也可用环境变量 `NCBI_API_KEY` |
 | `--out` | 输出 JSON 路径；`-` 输出到 stdout |
 
-流程：esearch 分页收集 PMID（单批最多 10000）→ efetch 分批拉 MEDLINE 文本 → 解析为统一 JSON。某一批失败会跳过并在 stderr 提示，不中断整体（与 SciSearch 同款容错）。
+流程：ESearch 拿句柄（usehistory 默认开，只调 1 次）→ EFetch 并发分批拉 MEDLINE → 解析为统一 JSON。
+某一批失败会跳过并在 stderr 提示，不中断整体。HTTP 层为 aiohttp 协程 + 限流重试。
 
 ### 2.2 fetch — 按 PMID 重新拉取
 
@@ -262,6 +267,8 @@ python scripts/download.py --input selected.json [--ids ...] --outdir papers/ \
 2. 没有 `pmc` → 用 idconv API 尝试 PMID→PMCID，命中则走 1；
 3. 仍不可得 → `manifest.json` 记录 `not_oa` + DOI/PubMed 落地页，请走机构权限获取。
 
+HTTP 层为 aiohttp 协程；NCBI 2026 年 OA 路径迁入 `deprecated/`，脚本内置路径重写。
+
 产物：
 
 ```
@@ -333,7 +340,7 @@ PubMed 高级检索语法：字段标签（`[MeSH Terms]`、`[Title/Abstract]`�
 用 `--query-file`：把检索式写入 UTF-8 文本文件传入。Windows 的 PowerShell / cmd 对引号处理尤其容易踩坑。
 
 **Q4：下载一直 404？**
-NCBI 已把 OA 包迁入 `deprecated/` 目录（2026-08 起旧路径下线）。本脚本 ≥v1.0 已自动兼容；
+NCBI 已把 OA 包迁入 `deprecated/` 目录（2026-08 起旧路径下线）。本脚本已自动兼容；
 若仍失败，看 manifest.json 里的 `message`——很多记录只提供 tgz 或不在 OA Subset。
 
 **Q5：报错 429 / 被限速？**

@@ -1,6 +1,7 @@
 # 开发文档 · medlit-search
 
 > 面向贡献者与二次开发者。阅读前建议先看 [USAGE.md](USAGE.md) 了解用户视角。
+> 用户使用流程与内部执行流程图见 [README.md](../README.md#用户使用流程)。
 
 ## 目录
 
@@ -21,13 +22,15 @@
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ 编排层  SKILL.md（WorkBuddy Skill：六步交互流程定义）                 │
+│ 编排层  SKILL.md（通用 Agent Skill：六步交互流程定义）                 │
 │         PICOS 分析 / 策略生成 / 初筛复筛由 LLM 完成                   │
 ├────────────────────────────────────────────────────────────────────┤
 │ 工具层  pubmed.py   import.py   screen.py   export.py   download.py │
 │         检索+解析    题录导入      关键词预筛    13种导出     OA下载   │
+│         fulltext.py  merge.py    workflow.py                        │
+│         全文准备      多源去重     一键导出                           │
 ├────────────────────────────────────────────────────────────────────┤
-│ 服务层  NCBI E-utilities · NLM MeSH RDF API · PubMed MEDLINE · PMC OA│
+│ 服务层  NCBI E-utilities · NLM MeSH RDF API · Unpaywall · PMC OA    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,7 +39,7 @@
 - **脚本无状态**：每一步读写 JSON 文件，任一步可中断续跑、可单独替换。
 - **统一 Paper Schema**：所有工具以同一论文 JSON 结构通信（见下节），
   新数据源只需把数据映射到该 Schema 即可复用导出/下载能力。
-- **标准库优先**：除 XLSX（openpyxl）外零三方依赖，降低部署门槛。
+- **依赖最小化**：HTTP 用 `aiohttp`，XLSX 用 `openpyxl`，其余标准库。
 - **合规内建**：限流、重试、OA-only 下载写死在工具层，不依赖使用者自觉。
 
 项目源流：检索/解析流程移植自桌面应用 **SciSearch**（C# WPF + F#，
@@ -97,11 +100,12 @@
 | `esearch.fcgi` | 检索拿 PMID | `db=pubmed, term, retmax, retstart, retmode=json, datetype=pdat, mindate, maxdate, sort` |
 | `efetch.fcgi` | 拉元数据 | `db=pubmed, id=逗号分隔, rettype=medline, retmode=text` |
 
-- **限流**：`RateLimiter` 全局串行，间隔 `1/3s`（无 key）或 `1/10s`（有 key），
-  与 SciSearch 的 `ResetTimer` 等价。key 经 `--api-key` 或 `NCBI_API_KEY` 注入。
-- **重试**：`http_get` 对 429/5xx/网络异常做指数退避（≤4 次，封顶 16s）；4xx 直接抛。
+- **限流**：`AsyncRateLimiter` 全局串行，间隔 `1/3s`（无 key）或 `1/10s`（有 key）。
+  key 经 `--api-key` 或 `NCBI_API_KEY` 注入。
+- **HTTP**：全部走 `aiohttp.ClientSession`（协程），`ahttp_get` / `ahttp_post` 对 429/5xx/网络异常做指数退避（≤4 次，封顶 16s）；非重试型 4xx 直接抛。
+- **重试**：指数退避；4xx 直接抛。
 - **分页**：esearch 单批 ≤10000；efetch 默认 200/批，单批失败跳过不中断。
-- **tool/email**：始终带 `tool=workbuddy_medlit`；建议调用方提供 `--email`（NCBI 礼仪）。
+- **tool/email**：始终带 `tool=medlit_search`；建议调用方提供 `--email`（NCBI 礼仪）。
 
 ## 5. MeSH 校验
 
@@ -212,6 +216,6 @@ Windows 注意：PowerShell 传参会拆分含空格/分号的参数——一律
 ## 10. 贡献指南
 
 - 欢迎 Issue / PR（bug、新数据源、新导出格式、文档改进）。
-- PR 请保持：标准库优先、Paper Schema 兼容、限流合规不被绕过。
+- PR 请保持：依赖最小化（HTTP 用 aiohttp，XLSX 用 openpyxl，其余标准库）、Paper Schema 兼容、限流合规不被绕过。
 -  commit message 用中文或英文均可，描述清楚"为什么改"。
 - 行为准则：友善、对事不对人；医学相关内容务必标注来源与不确定性。

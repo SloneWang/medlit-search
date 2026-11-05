@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fulltext.py — 复筛全文准备器（v1.5）
+fulltext.py — 复筛全文准备器（v1.7）
 
 用途：为"全文层面复筛"把全文文件凑齐，再由 LLM 直接读文件判定。
   1. 优先索引用户自己提供的 PDF/DOCX/TXT/...（按 DOI > PMID > PMC > 标题 匹配）
@@ -18,10 +18,10 @@ CLI:
                      [--outdir papers/] [--email <邮箱>] [--no-download]
                      --out fulltext_manifest.csv
 
-IO 模型（v1.6 起协程化）：需要走网络补全的文献各为一个 asyncio.Task，
+IO 模型（v1.7 aiohttp 原生协程）：需要走网络补全的文献各为一个 asyncio.Task，
 asyncio.Semaphore 限制在途下载数（_MAX_OA_CONCURRENCY=2），任务起步按
-_PACE_INTERVAL=0.6s 节流；阻塞式 Unpaywall 请求与下载在线程池执行
-（asyncio.to_thread）。manifest 行仍按文献池原顺序汇总。
+_PACE_INTERVAL=0.6s 节流；Unpaywall 请求与下载全部走 aiohttp.ClientSession。
+manifest 行仍按文献池原顺序汇总。依赖：aiohttp、Python 标准库。
 """
 
 from __future__ import annotations
@@ -34,10 +34,10 @@ import os
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
+
+import aiohttp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -45,6 +45,9 @@ try:  # 复用 download.py 的既有实现（slugify），不重复造轮子
     import download as _dl  # type: ignore
 except Exception:  # noqa: BLE001
     _dl = None  # type: ignore
+
+# 版本标识（与 SKILL.md 保持一致）
+__version__: str = "1.7"
 
 # 文献字典的类型别名
 Paper = dict[str, Any]
@@ -63,7 +66,7 @@ FULLTEXT_EXT: set[str] = {".pdf", ".docx", ".doc", ".txt", ".md", ".html", ".htm
 MIN_PDF_BYTES: int = 20000
 # 单篇文献最多尝试的 OA 候选链接数
 MAX_CANDIDATES: int = 6
-# 相邻下载任务的最小起步间隔（秒）：温和限速，替代旧版主循环的 time.sleep(0.6)
+# 相邻下载任务的最小起步间隔（秒）：温和限速
 _PACE_INTERVAL: float = 0.6
 # 在途 OA 下载并发上限
 _MAX_OA_CONCURRENCY: int = 2
@@ -118,7 +121,7 @@ def _norm_title(s: str) -> str:
     返回:
         归一化后的标题。
     """
-    return re.sub(r"[^\w\u4e00-\u9fff]", "", (s or "").lower())
+    return re.sub(r"[^\w一-鿿]", "", (s or "").lower())
 
 
 def _pmc_num(s: str) -> str:
@@ -256,35 +259,43 @@ def index_provided(papers: list[Paper], provide: list[str]) -> dict[int, tuple[s
 
 
 # ---------------------------------------------------------------------------
-# Unpaywall（合法 OA 渠道）
+# Unpaywall（合法 OA 渠道，aiohttp 协程）
 # ---------------------------------------------------------------------------
 
 
-def unpaywall_candidates(doi: str, email: str) -> tuple[list[str], dict[str, str], str]:
-    """-> (候选 URL 列表, URL->host_type, 错误信息)。"""
+async def unpaywall_candidates(
+    session: aiohttp.ClientSession, doi: str, email: str
+) -> tuple[list[str], dict[str, str], str]:
+    """查询 Unpaywall 获取 OA 候选链接。
+
+    参数:
+        session: aiohttp 会话。
+        doi: 文献 DOI。
+        email: Unpaywall 要求的联系邮箱。
+
+    返回:
+        (候选 URL 列表, URL->host_type, 错误信息)。
+    """
     url: str = f"{UNPAYWALL_API}{urllib.parse.quote(doi, safe='/')}?{urllib.parse.urlencode({'email': email or DEFAULT_EMAIL})}"
-    req: urllib.request.Request = urllib.request.Request(
-        url, headers={"User-Agent": UA, "Accept": "application/json"}
-    )
     data: dict[str, Any]
     try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        body: str = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            body = ""
-        msg: str = ""
-        try:
-            msg = str(json.loads(body).get("message", ""))
-        except Exception:  # noqa: BLE001
-            msg = body[:120]
-        hint: str = ""
-        if e.code == 422 and "email" in msg.lower():
-            hint = "（请用 --email 填你自己的真实邮箱，Unpaywall 会拒绝 example.com 之类的占位地址）"
-        return [], {}, f"Unpaywall 查询失败: HTTP {e.code} {msg}{hint}"
+        async with session.get(
+            url,
+            headers={"User-Agent": UA, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as r:
+            if r.status >= 400:
+                body: str = await r.text()
+                msg: str = ""
+                try:
+                    msg = str(json.loads(body).get("message", ""))
+                except Exception:  # noqa: BLE001
+                    msg = body[:120]
+                hint: str = ""
+                if r.status == 422 and "email" in msg.lower():
+                    hint = "（请用 --email 填你自己的真实邮箱，Unpaywall 会拒绝 example.com 之类的占位地址）"
+                return [], {}, f"Unpaywall 查询失败: HTTP {r.status} {msg}{hint}"
+            data = await r.json(content_type=None)
     except Exception as e:  # noqa: BLE001
         return [], {}, f"Unpaywall 查询失败: {type(e).__name__}: {e}"
 
@@ -318,10 +329,13 @@ def unpaywall_candidates(doi: str, email: str) -> tuple[list[str], dict[str, str
     return cands[:MAX_CANDIDATES], hosts, ""
 
 
-def fetch_bytes(url: str, doi: str, timeout: int = 120) -> bytes:
+async def fetch_bytes(
+    session: aiohttp.ClientSession, url: str, doi: str, timeout: int = 120
+) -> bytes:
     """下载单个候选 URL 的字节内容。
 
     参数:
+        session: aiohttp 会话。
         url: 待下载的候选链接。
         doi: 文献 DOI，用于构造 Referer 头。
         timeout: 单请求超时秒数。
@@ -330,7 +344,7 @@ def fetch_bytes(url: str, doi: str, timeout: int = 120) -> bytes:
         响应体的原始字节。
 
     异常:
-        无显式抛出；urllib 的网络异常由调用方捕获。
+        aiohttp / 网络异常由调用方捕获。
     """
     # 出版社直链必须带 UA/Referer，否则 403
     headers: dict[str, str] = {
@@ -338,16 +352,33 @@ def fetch_bytes(url: str, doi: str, timeout: int = 120) -> bytes:
         "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
         "Referer": "https://doi.org/" + doi,
     }
-    req: urllib.request.Request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    async with session.get(
+        url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as r:
+        if r.status >= 400:
+            raise RuntimeError(f"HTTP {r.status}")
+        return await r.read()
 
 
-def try_oa_download(paper: Paper, outdir: str, email: str, budget: float = 150.0) -> tuple[str, str, str]:
-    """-> (全文绝对路径, 获取方式 provided/unpaywall/pmc/none, 说明)。
+async def try_oa_download(
+    session: aiohttp.ClientSession,
+    paper: Paper,
+    outdir: str,
+    email: str,
+    budget: float = 150.0,
+) -> tuple[str, str, str]:
+    """尝试经 Unpaywall 为单篇文献下载 OA 全文。
 
-    budget 是单篇总时间预算：单请求 timeout 仍为 120s，但遇到 TLS 握手挂死的站点时
-    不再让它独占 2 分钟，避免 N 篇 × 6 候选退化成十几分钟。
+    参数:
+        session: aiohttp 会话。
+        paper: 文献字典。
+        outdir: PDF 保存目录。
+        email: Unpaywall 邮箱。
+        budget: 单篇总时间预算（秒）；单请求 timeout 仍为 120s，
+            但遇到 TLS 握手挂死的站点时不再让它独占 2 分钟。
+
+    返回:
+        (全文绝对路径, 获取方式 provided/unpaywall/pmc/none, 说明)。
     """
     deadline: float = time.monotonic() + budget  # 单篇总时间预算的截止时间戳
     doi: str = str(paper.get("doi") or "").strip()
@@ -357,7 +388,7 @@ def try_oa_download(paper: Paper, outdir: str, email: str, budget: float = 150.0
     cands: list[str]
     hosts: dict[str, str]
     err: str
-    cands, hosts, err = unpaywall_candidates(doi, email)
+    cands, hosts, err = await unpaywall_candidates(session, doi, email)
     if err:
         return "", "none", err
     if not cands:
@@ -375,14 +406,11 @@ def try_oa_download(paper: Paper, outdir: str, email: str, budget: float = 150.0
         raw: bytes
         try:
             # 剩余预算越紧，单请求超时越短，但保底 10s、封顶 120s
-            raw = fetch_bytes(u, doi, int(min(120, max(10, left))))
-        except urllib.error.HTTPError as e:
-            errs.append(f"HTTP {e.code}")
-            continue
+            raw = await fetch_bytes(session, u, doi, int(min(120, max(10, left))))
         except Exception as e:  # noqa: BLE001
-            errs.append(type(e).__name__)
+            errs.append(f"{type(e).__name__}:{e}" if str(e) else type(e).__name__)
             continue
-        if raw[:4] != b"%PDF":  # 双重校验之一：%PDF 魔数不符即反爬页/HTML 拦截页（PMC 常回 ~1.8KB HTML，Cloudflare 可能回几百 KB 拦截页）
+        if raw[:4] != b"%PDF":  # 双重校验之一：%PDF 魔数不符即反爬页/HTML 拦截页
             errs.append("魔数不符")
             continue
         if len(raw) < MIN_PDF_BYTES:  # 双重校验之二：真 PDF 至少几十 KB，过小视为伪命中
@@ -463,13 +491,6 @@ async def _run_async(
             await asyncio.sleep(pace_next - now)
         pace_next = time.monotonic() + _PACE_INTERVAL
 
-    async def download_one_task(i: int) -> tuple[int, str, str, str]:
-        """单篇 OA 补全任务：节流 -> 线程池执行阻塞下载。"""
-        async with sem:
-            await pace()
-            path, source, note = await asyncio.to_thread(try_oa_download, papers[i], outdir, email)
-            return i, path, source, note
-
     # 先确定哪些下标需要走网络补全
     todo: list[int] = [
         i for i in range(len(papers))
@@ -477,9 +498,22 @@ async def _run_async(
     ]
     results: dict[int, tuple[str, str, str]] = {}
     if todo:
-        gathered: list[tuple[int, str, str, str]] = await asyncio.gather(
-            *[download_one_task(i) for i in todo]
-        )
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": UA}
+        ) as session:
+
+            async def download_one_task(i: int) -> tuple[int, str, str, str]:
+                """单篇 OA 补全任务：节流 -> 协程下载。"""
+                async with sem:
+                    await pace()
+                    path, source, note = await try_oa_download(
+                        session, papers[i], outdir, email
+                    )
+                    return i, path, source, note
+
+            gathered: list[tuple[int, str, str, str]] = await asyncio.gather(
+                *[download_one_task(i) for i in todo]
+            )
         for i, path, source, note in gathered:
             results[i] = (path, source, note)
 

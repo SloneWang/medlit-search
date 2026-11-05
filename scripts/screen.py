@@ -24,6 +24,9 @@ import re
 import sys
 from typing import Any, Callable
 
+# 版本标识（与 SKILL.md 保持一致）
+__version__: str = 1.7
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export import FIELD_LABELS, best_url, cell_value  # type: ignore
 
@@ -303,7 +306,7 @@ def _write_screening_csv(papers: list[dict[str, Any]], out: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# prepare / apply：可人工复核的审查表（v1.5）
+# prepare / apply：可人工复核的审查表（medlit-search v1.7）
 #
 #   prepare  生成"决策/理由"留空的 CSV，交给人或 LLM 逐篇填
 #   apply    把填好的 CSV 回填成 paper["decision"]，产出带 decision 的 JSON

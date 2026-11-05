@@ -1,0 +1,5 @@
+# medlit-search v1.7 — Python >= 3.10
+# 网络 IO（PubMed / Unpaywall / PMC OA）
+aiohttp>=3.9,<4
+# XLSX 导出（export.py --format xlsx）
+openpyxl>=3.1

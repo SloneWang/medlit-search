@@ -11,17 +11,16 @@ pubmed.py — PubMed (NCBI E-utilities) 检索 / 拉取 / MeSH 校验工具
       1) 发表日期用 DP（实际发表日期），SciSearch 误用 MHDA（MeSH 标引日期）
       2) F# 解析器 List.pairwise 会丢失每条记录最后一个属性，此处修复
 
-IO 模型（v1.6 起协程化）：
-  - search / fetch 子命令基于 asyncio：AsyncRateLimiter 保证请求起步间隔
+IO 模型（v1.7 起 aiohttp 原生协程）：
+  - 全部 HTTP 走 aiohttp.ClientSession；AsyncRateLimiter 保证请求起步间隔
     （无 key 3 req/s，有 key 10 req/s），asyncio.Semaphore 限制在途请求数
-    （无 key 3 / 有 key 10），阻塞式 urllib 调用经 asyncio.to_thread 包装，
-    不引入任何第三方依赖；
+    （无 key 3 / 有 key 10）；
+  - search / fetch / mesh 子命令均为协程入口，CLI 用 asyncio.run 启动；
   - EFetch 各批次作为 asyncio.Task 并发拉取并就地解析（CPU 轻量），
-    最后统一按发表日期降序重排，与 v1.5 线程版行为一致；
-  - mesh 子命令调用量小，保持同步实现。
+    最后统一按发表日期降序重排。
 
 限流：无 API key 3 req/s，有 key 10 req/s（NCBI 官方限制）。
-仅依赖 Python 标准库。
+依赖：aiohttp（HTTP）、Python 标准库。
 
 参数语义（与 NCBI 文档一致）：
   --limit   : 用户希望拉取的文献总量（0=全部，即无限）。未设日期范围时须向用户确认。
@@ -32,7 +31,7 @@ IO 模型（v1.6 起协程化）：
               可选 pub_date / relevance / most_recent / journal / title；
               usehistory 模式下排序会被保留，EFetch 按该顺序取回（NCBI 官方语义），
               拉取完成后脚本再按解析出的 date 做一次客户端降序，双保险保证最新在前。
-  ESearch 分页页大小固定 retmax=20（内部常量 ESearch_PAGE_SIZE，v1.6 起不对用户暴露）。
+  ESearch 分页页大小固定 retmax=20（内部常量 ESearch_PAGE_SIZE，不对用户暴露）。
 
 检索式编码约定（与 Biopython 的 Bio.Entrez 处理方式一致）：
   - 空白（空格/制表符/换行）在检索前先归一化为单个空格，再由 urllib.parse.urlencode
@@ -40,7 +39,7 @@ IO 模型（v1.6 起协程化）：
   - | [ ] " 等非 ASCII 字符按百分号编码（%7C %5B %5D %22 等），与 Biopython 相同，
     符合 NCBI "special characters must be URL encoded" 的要求，无需特殊处理。
   - 超长检索式：参数编码后超过 POST_CHAR_THRESHOLD（500 字符）时自动改用 HTTP POST
-    （NCBI 建议 "For very long queries ... consider using an HTTP POST call"），见 http_post()。
+    （NCBI 建议 "For very long queries ... consider using an HTTP POST call"），见 ahttp_post()。
 
 已知 API 限制（NCBI E-utilities In-Depth）：
   - PubMed 的 ESearch 单次查询最多返回前 10000 条匹配记录；
@@ -61,23 +60,26 @@ import os
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
+
+import aiohttp
+
+# 版本标识（与 SKILL.md 保持一致）
+__version__: str = "1.7"
 
 # NCBI E-utilities 各工具的统一入口前缀
 EUTILS: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 # NLM MeSH RDF lookup API（校验术语用，无需 API key）
 MESH_LOOKUP: str = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
 # User-Agent：NCBI 要求客户端标识自己，便于其追踪滥用来源
-USER_AGENT: str = "workbuddy-medlit-skill/1.2 (PubMed literature screening)"
+USER_AGENT: str = "medlit-search/1.7 (PubMed literature screening)"
 
 # NCBI 建议 EFetch 单批不超过 200 个 UID（URL 过长会失败）
 MAX_EFETCH_BATCH: int = 200
 
-# ESearch 分页页大小固定 20（内部参数，v1.6 起不再暴露 --retmax，也不询问用户）
+# ESearch 分页页大小固定 20（内部参数，不暴露 --retmax，也不询问用户）
 ESearch_PAGE_SIZE: int = 20
 
 # 检索式参数编码后超过该字符数即改用 HTTP POST（NCBI：超长查询建议 POST）
@@ -101,51 +103,11 @@ def _max_in_flight(api_key: str | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-class RateLimiter:
-    """同步版限流器（供 mesh 等低频同步路径使用）。
-
-    移植自 SciSearch 的 EUtilities.ResetTimer：任意时刻只允许一个"请求间最小间隔"，
-    保证对 NCBI 的访问频率不超过官方上限（无 key 3 req/s，有 key 10 req/s）。
-
-    属性:
-        api_key: NCBI API key；为空则按 3 req/s 限流。
-        interval: 相邻两次请求的最小间隔（秒）。
-        _next: 下一次允许发起请求的单调时钟时间点。
-    """
-
-    def __init__(self, api_key: str | None) -> None:
-        """初始化限流器并按是否有 API key 设定速率。
-
-        参数:
-            api_key: NCBI API key；None 或空串表示未配置，使用 3 req/s。
-        """
-        self.api_key: str | None = api_key or os.environ.get("NCBI_API_KEY")
-        self.interval: float = 1.0 / (10.0 if self.api_key else 3.0)
-        self._next: float = 0.0
-
-    def wait(self) -> None:
-        """阻塞到下一个允许请求的时间点，并推进内部时钟。
-
-        参数:
-            无。
-
-        返回:
-            None（可能 sleep）。
-
-        异常:
-            无显式抛出。
-        """
-        now: float = time.monotonic()
-        if now < self._next:
-            time.sleep(self._next - now)
-        self._next = time.monotonic() + self.interval
-
-
 class AsyncRateLimiter:
-    """协程版限流器（search / fetch 主路径使用）。
+    """协程版限流器（全部 HTTP 路径共用）。
 
-    与 RateLimiter 同一语义（起步间隔 >= interval），但用 asyncio.sleep 让出事件循环：
-    检查与推进 _next 之间没有 await 点，单事件循环内原子执行，无竞态。
+    与原同步 RateLimiter 同一语义（起步间隔 >= interval），但用 asyncio.sleep
+    让出事件循环：检查与推进 _next 之间没有 await 点，单事件循环内原子执行，无竞态。
 
     属性:
         interval: 相邻两次请求起步的最小间隔（秒）。
@@ -180,66 +142,68 @@ class AsyncRateLimiter:
         self._next = time.monotonic() + self.interval
 
 
-# 模块级懒加载单例：供同步 http_get 默认限流（mesh 路径）
-_LIMITER: RateLimiter | None = None
-
-
-def _limiter() -> RateLimiter:
-    """返回模块级同步 RateLimiter 单例（懒创建）。"""
-    global _LIMITER
-    if _LIMITER is None:
-        _LIMITER = RateLimiter(None)
-    return _LIMITER
-
-
-def http_get(url: str, timeout: int = 60, retries: int = 4, use_limiter: bool = True) -> bytes:
-    """带限流 + 指数退避重试的 GET。
+async def ahttp_get(
+    session: aiohttp.ClientSession,
+    url: str,
+    limiter: AsyncRateLimiter | None = None,
+    timeout: int = 60,
+    retries: int = 4,
+) -> bytes:
+    """带限流 + 指数退避重试的异步 GET（aiohttp）。
 
     参数:
+        session: aiohttp 会话。
         url: 完整请求 URL。
+        limiter: 协程限流器；None 表示调用方已自行限流。
         timeout: 单次请求超时（秒）。
         retries: 最大尝试次数；429 或 5xx 以及网络层错误会退避重试。
-        use_limiter: 是否走模块级同步限流；协程路径已用 AsyncRateLimiter
-            控制起步节奏，应传 False 避免双重等待。
 
     返回:
         响应体的原始字节。
 
     异常:
-        RuntimeError: 重试耗尽仍失败。
-        urllib.error.HTTPError: 非 429/5xx 的 HTTP 错误直接抛出。
+        RuntimeError: 重试耗尽仍失败，或非 429/5xx 的 HTTP 错误。
     """
     last_err: Exception | None = None
     for attempt in range(retries):
-        if use_limiter:
-            _limiter().wait()
-        req: urllib.request.Request = urllib.request.Request(
-            url, headers={"User-Agent": USER_AGENT}
-        )
+        if limiter is not None:
+            await limiter.acquire()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as e:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status == 429 or resp.status >= 500:
+                    last_err = RuntimeError(f"HTTP {resp.status}")
+                    await asyncio.sleep(min(2.0**attempt, 16.0))
+                    continue
+                if resp.status >= 400:
+                    body: str = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
+                return await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e
-            if e.code == 429 or e.code >= 500:
-                time.sleep(min(2.0 ** attempt, 16.0))
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
-            time.sleep(min(2.0 ** attempt, 16.0))
+            await asyncio.sleep(min(2.0**attempt, 16.0))
     raise RuntimeError(f"请求失败（重试 {retries} 次后仍失败）: {url} -> {last_err}")
 
 
-def http_post(url_base: str, params: dict[str, str | None], timeout: int = 60, retries: int = 4) -> bytes:
-    """带指数退避重试的 POST（参数放请求体，用于超长检索式；限流由调用方负责）。
+async def ahttp_post(
+    session: aiohttp.ClientSession,
+    url_base: str,
+    params: dict[str, str | None],
+    limiter: AsyncRateLimiter | None = None,
+    timeout: int = 60,
+    retries: int = 4,
+) -> bytes:
+    """带指数退避重试的异步 POST（参数放请求体，用于超长检索式）。
 
     NCBI E-utilities 文档：超长查询（编码后数百字符以上）应改用 HTTP POST，
     避免 URL 过长被代理或服务端截断。参数编码规则与 GET 完全一致（见模块 docstring）。
 
     参数:
+        session: aiohttp 会话。
         url_base: 工具入口地址（如 .../esearch.fcgi），不带 query string。
         params: 参数字典；None / 空串值会被丢弃。
+        limiter: 协程限流器；None 表示调用方已自行限流。
         timeout: 单次请求超时（秒）。
         retries: 最大尝试次数；429 或 5xx 以及网络层错误会退避重试。
 
@@ -247,32 +211,31 @@ def http_post(url_base: str, params: dict[str, str | None], timeout: int = 60, r
         响应体的原始字节。
 
     异常:
-        RuntimeError: 重试耗尽仍失败。
-        urllib.error.HTTPError: 非 429/5xx 的 HTTP 错误直接抛出。
+        RuntimeError: 重试耗尽仍失败，或非 429/5xx 的 HTTP 错误。
     """
     body: bytes = _urlencode(params).encode("utf-8")
     last_err: Exception | None = None
     for attempt in range(retries):
-        req: urllib.request.Request = urllib.request.Request(
-            url_base,
-            data=body,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
+        if limiter is not None:
+            await limiter.acquire()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as e:
+            async with session.post(
+                url_base,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status == 429 or resp.status >= 500:
+                    last_err = RuntimeError(f"HTTP {resp.status}")
+                    await asyncio.sleep(min(2.0**attempt, 16.0))
+                    continue
+                if resp.status >= 400:
+                    text: str = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                return await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e
-            if e.code == 429 or e.code >= 500:
-                time.sleep(min(2.0 ** attempt, 16.0))
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
-            time.sleep(min(2.0 ** attempt, 16.0))
+            await asyncio.sleep(min(2.0**attempt, 16.0))
     raise RuntimeError(f"POST 请求失败（重试 {retries} 次后仍失败）: {url_base} -> {last_err}")
 
 
@@ -285,7 +248,7 @@ def _tool_params(args: argparse.Namespace) -> dict[str, str]:
     返回:
         非空的 tool/email/api_key 参数字典。
     """
-    p: dict[str, str] = {"tool": "workbuddy_medlit"}
+    p: dict[str, str] = {"tool": "medlit_search"}
     if getattr(args, "email", None):
         p["email"] = args.email
     api_key: str | None = getattr(args, "api_key", None) or os.environ.get("NCBI_API_KEY")
@@ -706,27 +669,12 @@ def parse_pubmed_xml(text: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# E-utilities（协程封装：限流 acquire + to_thread 包装阻塞 HTTP）
+# E-utilities（aiohttp 协程调用）
 # ---------------------------------------------------------------------------
 
 
-async def _ahttp_get(url: str, limiter: AsyncRateLimiter, timeout: int = 60, retries: int = 4) -> bytes:
-    """协程版 GET：先按限流器节奏排队，再在线程池执行阻塞请求。
-
-    参数:
-        url: 完整请求 URL。
-        limiter: 协程限流器（控制请求起步间隔）。
-        timeout: 单次请求超时（秒）。
-        retries: 重试次数（透传 http_get）。
-
-    返回:
-        响应体字节。
-    """
-    await limiter.acquire()
-    return await asyncio.to_thread(http_get, url, timeout, retries, False)
-
-
 async def esearch(
+    session: aiohttp.ClientSession,
     args: argparse.Namespace,
     query: str,
     retstart: int,
@@ -740,6 +688,7 @@ async def esearch(
     参数编码规则不变（见模块 docstring 的编码约定）。
 
     参数:
+        session: aiohttp 会话。
         args: 命令行命名空间；读取 sort/mindate/maxdate/datetype/api_key/email。
         query: 完整 PubMed 检索式（空白已归一化）。
         retstart: 本页起始偏移（0 基）。
@@ -751,7 +700,7 @@ async def esearch(
         esearchresult 字典；至少含 count 与 idlist，usehistory 时另有 webenv/querykey。
 
     异常:
-        RuntimeError: 经由 http_get / http_post 在重试耗尽时抛出。
+        RuntimeError: 经由 ahttp_get / ahttp_post 在重试耗尽时抛出。
     """
     params: dict[str, str | None] = {
         "db": "pubmed",
@@ -770,24 +719,27 @@ async def esearch(
     if getattr(args, "datetype", None):
         params["datetype"] = args.datetype
     params.update(_tool_params(args))
-    await limiter.acquire()
     # NCBI 建议：编码后超长的查询改用 HTTP POST，避免 URL 被代理/服务端截断
     encoded: str = _urlencode(params)
     raw: bytes
     if len(encoded) > POST_CHAR_THRESHOLD:
-        raw = await asyncio.to_thread(http_post, f"{EUTILS}/esearch.fcgi", params)
+        raw = await ahttp_post(session, f"{EUTILS}/esearch.fcgi", params, limiter)
     else:
-        raw = await asyncio.to_thread(http_get, f"{EUTILS}/esearch.fcgi?{encoded}", 60, 4, False)
+        raw = await ahttp_get(session, f"{EUTILS}/esearch.fcgi?{encoded}", limiter)
     data: dict[str, Any] = json.loads(raw.decode("utf-8"))
     return data.get("esearchresult", {})
 
 
 async def efetch_medline(
-    args: argparse.Namespace, pmids: list[str], limiter: AsyncRateLimiter
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    pmids: list[str],
+    limiter: AsyncRateLimiter,
 ) -> tuple[list[dict[str, Any]], list[list[tuple[str, str]]]]:
     """按 PMID 列表走 efetch.fcgi 拉 MEDLINE 文本并解析（协程）。
 
     参数:
+        session: aiohttp 会话。
         args: 命令行命名空间。
         pmids: PMID 列表（单批建议 <=200）。
         limiter: 协程限流器。
@@ -803,7 +755,9 @@ async def efetch_medline(
     }
     params.update(_tool_params(args))
     url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-    text: str = (await _ahttp_get(url, limiter, timeout=120)).decode("utf-8", errors="replace")
+    text: str = (await ahttp_get(session, url, limiter, timeout=120)).decode(
+        "utf-8", errors="replace"
+    )
     records: list[list[tuple[str, str]]] = parse_medline(text)
     papers: list[dict[str, Any]] = [record_to_paper(r) for r in records]
     attach_raw_medline(papers, records)
@@ -811,11 +765,15 @@ async def efetch_medline(
 
 
 async def efetch_xml(
-    args: argparse.Namespace, pmids: list[str], limiter: AsyncRateLimiter
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    pmids: list[str],
+    limiter: AsyncRateLimiter,
 ) -> list[dict[str, Any]]:
     """按 PMID 列表走 efetch.fcgi 拉 PubMed XML 并解析（协程）。
 
     参数:
+        session: aiohttp 会话。
         args: 命令行命名空间。
         pmids: PMID 列表（单批建议 <=200）。
         limiter: 协程限流器。
@@ -830,7 +788,9 @@ async def efetch_xml(
     }
     params.update(_tool_params(args))
     url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-    text: str = (await _ahttp_get(url, limiter, timeout=120)).decode("utf-8", errors="replace")
+    text: str = (await ahttp_get(session, url, limiter, timeout=120)).decode(
+        "utf-8", errors="replace"
+    )
     return parse_pubmed_xml(text)
 
 
@@ -904,131 +864,137 @@ async def _cmd_search_async(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # 1) ESearch 收集检索结果句柄
-    idlist: list[str] = []
-    total: int = 0
-    webenv: str = ""
-    query_key: str = ""
-    plan: int = 0  # 计划拉取篇数 = min(total, limit)（limit>0 时）；usehistory 下驱动 EFetch 窗口
-    if usehistory:
-        # usehistory 模式：ESearch 会把完整结果集按排序挂到 History 服务器，
-        # 一次调用即可拿到 count + WebEnv/query_key；EFetch 用 retstart/retmax 窗口取。
-        # 避免 retmax=20 时按页收集 UID 造成大量无效 ESearch 请求（API 调用优化）。
-        res: dict[str, Any] = await esearch(args, query, 0, retmax, True, limiter)
-        total = int(res.get("count", "0"))
-        webenv = str(res.get("webenv", "") or "")
-        query_key = str(res.get("querykey", "") or "")
-        plan = min(total, limit) if limit > 0 else total
-    else:
-        # 退化模式：无 History 服务器可用，只能按 retstart/retmax 分页收集 UID
-        retstart: int = 0
-        while True:
-            # 若用户设了 limit，本页大小取 min(页大小, 剩余数量)
-            page: int = retmax
-            if limit > 0:
-                remaining: int = limit - len(idlist)
-                if remaining <= 0:
-                    break
-                page = min(retmax, remaining)
-
-            res = await esearch(args, query, retstart, page, False, limiter)
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT}, timeout=timeout
+    ) as session:
+        # 1) ESearch 收集检索结果句柄
+        idlist: list[str] = []
+        total: int = 0
+        webenv: str = ""
+        query_key: str = ""
+        plan: int = 0  # 计划拉取篇数 = min(total, limit)（limit>0 时）；usehistory 下驱动 EFetch 窗口
+        if usehistory:
+            # usehistory 模式：ESearch 会把完整结果集按排序挂到 History 服务器，
+            # 一次调用即可拿到 count + WebEnv/query_key；EFetch 用 retstart/retmax 窗口取。
+            res: dict[str, Any] = await esearch(session, args, query, 0, retmax, True, limiter)
             total = int(res.get("count", "0"))
-            ids: list[str] = res.get("idlist", [])
-            returned: int = int(res.get("retmax", len(ids)))
-            idlist.extend(ids)
-            if limit > 0 and len(idlist) >= limit:
-                idlist = idlist[:limit]
-                break
-            if returned < page or not ids:
-                break
-            retstart += returned
-        plan = len(idlist)
+            webenv = str(res.get("webenv", "") or "")
+            query_key = str(res.get("querykey", "") or "")
+            plan = min(total, limit) if limit > 0 else total
+        else:
+            # 退化模式：无 History 服务器可用，只能按 retstart/retmax 分页收集 UID
+            retstart: int = 0
+            while True:
+                page: int = retmax
+                if limit > 0:
+                    remaining: int = limit - len(idlist)
+                    if remaining <= 0:
+                        break
+                    page = min(retmax, remaining)
 
-    total_out: int = min(total, limit) if limit > 0 else total
-    print(f"[esearch] 命中 {total} 条，计划拉取 {plan} 条", file=sys.stderr)
+                res = await esearch(session, args, query, retstart, page, False, limiter)
+                total = int(res.get("count", "0"))
+                ids: list[str] = res.get("idlist", [])
+                returned: int = int(res.get("retmax", len(ids)))
+                idlist.extend(ids)
+                if limit > 0 and len(idlist) >= limit:
+                    idlist = idlist[:limit]
+                    break
+                if returned < page or not ids:
+                    break
+                retstart += returned
+            plan = len(idlist)
 
-    # 大结果集提示
-    if limit == 0 and total > 200:
-        print(
-            f"[warn] 未设置 --limit，将拉取全部 {total} 条。"
-            "如只需样例，请用 --limit 设置上限以节省时间和带宽。",
-            file=sys.stderr,
-        )
-    # NCBI 硬性限制：PubMed ESearch 单次查询最多返回前 10000 条
-    if total > 10000:
-        print(
-            f"[warn] PubMed ESearch 单次查询最多返回前 10000 条（本查询命中 {total}）。"
-            "超出部分需用 EDirect 或按日期分段查询获取。",
-            file=sys.stderr,
-        )
+        total_out: int = min(total, limit) if limit > 0 else total
+        print(f"[esearch] 命中 {total} 条，计划拉取 {plan} 条", file=sys.stderr)
 
-    # 2) EFetch 拉取元数据：每批一个协程任务，信号量限在途数、限流器控起步节奏
-    retmode: str = getattr(args, "retmode", "medline")
-    batch: int = args.batch
-    papers: list[dict[str, Any]] = []
-    fetch_errors: list[str] = []
+        # 大结果集提示
+        if limit == 0 and total > 200:
+            print(
+                f"[warn] 未设置 --limit，将拉取全部 {total} 条。"
+                "如只需样例，请用 --limit 设置上限以节省时间和带宽。",
+                file=sys.stderr,
+            )
+        # NCBI 硬性限制：PubMed ESearch 单次查询最多返回前 10000 条
+        if total > 10000:
+            print(
+                f"[warn] PubMed ESearch 单次查询最多返回前 10000 条（本查询命中 {total}）。"
+                "超出部分需用 EDirect 或按日期分段查询获取。",
+                file=sys.stderr,
+            )
 
-    async def fetch_window(start: int) -> tuple[list[dict[str, Any]], str]:
-        """单个 EFetch 窗口的协程任务：限流 -> 拉取 -> 就地解析。
+        # 2) EFetch 拉取元数据：每批一个协程任务，信号量限在途数、限流器控起步节奏
+        retmode: str = getattr(args, "retmode", "medline")
+        batch: int = args.batch
+        papers: list[dict[str, Any]] = []
+        fetch_errors: list[str] = []
 
-        参数:
-            start: 窗口起始偏移（usehistory 下对应历史会话 retstart；
-                退化模式下映射到 idlist 切片）。
+        async def fetch_window(start: int) -> tuple[list[dict[str, Any]], str]:
+            """单个 EFetch 窗口的协程任务：限流 -> 拉取 -> 就地解析。
 
-        返回:
-            (该批 papers, 错误信息)；成功时错误信息为空串。
-        """
-        async with sem:
-            this_batch: int = min(batch, plan - start)
-            end: int = start + this_batch
-            try:
-                if usehistory and webenv and query_key:
-                    # 历史会话保存完整排序结果集，retstart/retmax 只是取数窗口
-                    params: dict[str, str | None] = {
-                        "db": "pubmed",
-                        "query_key": query_key,
-                        "WebEnv": webenv,
-                        "retstart": str(start),
-                        "retmax": str(this_batch),
-                    }
-                    if retmode == "xml":
-                        params["retmode"] = "xml"
+            参数:
+                start: 窗口起始偏移（usehistory 下对应历史会话 retstart；
+                    退化模式下映射到 idlist 切片）。
+
+            返回:
+                (该批 papers, 错误信息)；成功时错误信息为空串。
+            """
+            async with sem:
+                this_batch: int = min(batch, plan - start)
+                end: int = start + this_batch
+                try:
+                    if usehistory and webenv and query_key:
+                        # 历史会话保存完整排序结果集，retstart/retmax 只是取数窗口
+                        params: dict[str, str | None] = {
+                            "db": "pubmed",
+                            "query_key": query_key,
+                            "WebEnv": webenv,
+                            "retstart": str(start),
+                            "retmax": str(this_batch),
+                        }
+                        if retmode == "xml":
+                            params["retmode"] = "xml"
+                        else:
+                            params["retmode"] = "text"
+                            params["rettype"] = "medline"
+                        params.update(_tool_params(args))
+                        url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+                        text: str = (await ahttp_get(session, url, limiter, timeout=120)).decode(
+                            "utf-8", errors="replace"
+                        )
+                        chunk_papers: list[dict[str, Any]] = parse_chunk_text(text, retmode)
                     else:
-                        params["retmode"] = "text"
-                        params["rettype"] = "medline"
-                    params.update(_tool_params(args))
-                    url: str = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-                    text: str = (await _ahttp_get(url, limiter, timeout=120)).decode("utf-8", errors="replace")
-                    chunk_papers: list[dict[str, Any]] = parse_chunk_text(text, retmode)
-                else:
-                    # 退化模式：显式 PMID 列表
-                    chunk_ids: list[str] = idlist[start:end]
-                    params = {
-                        "db": "pubmed",
-                        "id": ",".join(chunk_ids),
-                    }
-                    if retmode == "xml":
-                        params["retmode"] = "xml"
-                    else:
-                        params["retmode"] = "text"
-                        params["rettype"] = "medline"
-                    params.update(_tool_params(args))
-                    url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
-                    text = (await _ahttp_get(url, limiter, timeout=120)).decode("utf-8", errors="replace")
-                    chunk_papers = parse_chunk_text(text, retmode)
-                print(f"[efetch] {end}/{plan}", file=sys.stderr)
-                return chunk_papers, ""
-            except Exception as e:
-                return [], f"批次 {start}-{end} 拉取失败: {e}"
+                        # 退化模式：显式 PMID 列表
+                        chunk_ids: list[str] = idlist[start:end]
+                        params = {
+                            "db": "pubmed",
+                            "id": ",".join(chunk_ids),
+                        }
+                        if retmode == "xml":
+                            params["retmode"] = "xml"
+                        else:
+                            params["retmode"] = "text"
+                            params["rettype"] = "medline"
+                        params.update(_tool_params(args))
+                        url = f"{EUTILS}/efetch.fcgi?{_urlencode(params)}"
+                        text = (await ahttp_get(session, url, limiter, timeout=120)).decode(
+                            "utf-8", errors="replace"
+                        )
+                        chunk_papers = parse_chunk_text(text, retmode)
+                    print(f"[efetch] {end}/{plan}", file=sys.stderr)
+                    return chunk_papers, ""
+                except Exception as e:
+                    return [], f"批次 {start}-{end} 拉取失败: {e}"
 
-    window_starts: list[int] = list(range(0, plan, batch))
-    results: list[tuple[list[dict[str, Any]], str]] = await asyncio.gather(
-        *[fetch_window(s) for s in window_starts]
-    )
-    for chunk_papers, err in results:
-        papers.extend(chunk_papers)
-        if err:
-            fetch_errors.append(err)
+        window_starts: list[int] = list(range(0, plan, batch))
+        results: list[tuple[list[dict[str, Any]], str]] = await asyncio.gather(
+            *[fetch_window(s) for s in window_starts]
+        )
+        for chunk_papers, err in results:
+            papers.extend(chunk_papers)
+            if err:
+                fetch_errors.append(err)
 
     for err in fetch_errors:
         print(f"[efetch] {err}", file=sys.stderr)
@@ -1085,35 +1051,41 @@ async def _cmd_fetch_async(args: argparse.Namespace) -> int:
     papers: list[dict[str, Any]] = []
     fetch_errors: list[str] = []
 
-    async def fetch_chunk(start: int) -> tuple[list[dict[str, Any]], str]:
-        """单批 PMID 拉取任务。
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT}
+    ) as session:
 
-        参数:
-            start: 本批在 pmids 中的起始下标。
+        async def fetch_chunk(start: int) -> tuple[list[dict[str, Any]], str]:
+            """单批 PMID 拉取任务。
 
-        返回:
-            (该批 papers, 错误信息)；成功时错误信息为空串。
-        """
-        async with sem:
-            chunk: list[str] = pmids[start : start + args.batch]
-            end: int = start + len(chunk)
-            try:
-                if retmode == "xml":
-                    chunk_papers: list[dict[str, Any]] = await efetch_xml(args, chunk, limiter)
-                else:
-                    chunk_papers, _ = await efetch_medline(args, chunk, limiter)
-                print(f"[efetch] {end}/{len(pmids)}", file=sys.stderr)
-                return chunk_papers, ""
-            except Exception as e:
-                return [], f"批次 {start}-{end} 拉取失败: {e}"
+            参数:
+                start: 本批在 pmids 中的起始下标。
 
-    results: list[tuple[list[dict[str, Any]], str]] = await asyncio.gather(
-        *[fetch_chunk(i) for i in range(0, len(pmids), args.batch)]
-    )
-    for chunk_papers, err in results:
-        papers.extend(chunk_papers)
-        if err:
-            fetch_errors.append(err)
+            返回:
+                (该批 papers, 错误信息)；成功时错误信息为空串。
+            """
+            async with sem:
+                chunk: list[str] = pmids[start : start + args.batch]
+                end: int = start + len(chunk)
+                try:
+                    if retmode == "xml":
+                        chunk_papers: list[dict[str, Any]] = await efetch_xml(
+                            session, args, chunk, limiter
+                        )
+                    else:
+                        chunk_papers, _ = await efetch_medline(session, args, chunk, limiter)
+                    print(f"[efetch] {end}/{len(pmids)}", file=sys.stderr)
+                    return chunk_papers, ""
+                except Exception as e:
+                    return [], f"批次 {start}-{end} 拉取失败: {e}"
+
+        results: list[tuple[list[dict[str, Any]], str]] = await asyncio.gather(
+            *[fetch_chunk(i) for i in range(0, len(pmids), args.batch)]
+        )
+        for chunk_papers, err in results:
+            papers.extend(chunk_papers)
+            if err:
+                fetch_errors.append(err)
     for err in fetch_errors:
         print(f"[efetch] {err}", file=sys.stderr)
 
@@ -1133,7 +1105,7 @@ async def _cmd_fetch_async(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
-    """fetch 子命令的同步入口：在独立事件循环中跑协程版实现。
+    """fetch 子命令入口：在独立事件循环中跑协程版实现。
 
     参数:
         args: fetch 子命令的命名空间。
@@ -1145,15 +1117,19 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# MeSH 校验（NLM MeSH RDF lookup API，无需 key；调用量小，保持同步）
+# MeSH 校验（NLM MeSH RDF lookup API，无需 key；aiohttp 协程）
 # ---------------------------------------------------------------------------
 
 
-def _mesh_descriptor_label(descriptor_id: str) -> str:
+async def _mesh_descriptor_label(
+    session: aiohttp.ClientSession, descriptor_id: str, limiter: AsyncRateLimiter
+) -> str:
     """按 descriptor id 取 MeSH 官方标签文本；失败返回空串。"""
     url: str = f"https://id.nlm.nih.gov/mesh/{descriptor_id}.json"
     try:
-        data: dict[str, Any] = json.loads(http_get(url).decode("utf-8"))
+        data: dict[str, Any] = json.loads(
+            (await ahttp_get(session, url, limiter)).decode("utf-8")
+        )
         label: Any = data.get("label", {})
         if isinstance(label, dict):
             return label.get("@value", "")
@@ -1162,12 +1138,19 @@ def _mesh_descriptor_label(descriptor_id: str) -> str:
         return ""
 
 
-def mesh_lookup(term: str, match: str) -> list[str]:
+async def mesh_lookup(
+    session: aiohttp.ClientSession,
+    term: str,
+    match: str,
+    limiter: AsyncRateLimiter,
+) -> list[str]:
     """调用 MeSH lookup API，返回匹配的 descriptor id 列表。
 
     参数:
+        session: aiohttp 会话。
         term: 待查术语。
         match: 匹配模式，'exact' 精确或 'contains' 包含。
+        limiter: 协程限流器。
 
     返回:
         descriptor id（D/C 开头）列表；无命中为空列表。
@@ -1175,7 +1158,7 @@ def mesh_lookup(term: str, match: str) -> list[str]:
     url: str = (
         f"{MESH_LOOKUP}?{_urlencode({'label': term, 'match': match, 'limit': '10'})}"
     )
-    data: Any = json.loads(http_get(url).decode("utf-8"))
+    data: Any = json.loads((await ahttp_get(session, url, limiter)).decode("utf-8"))
     out: list[str] = []
     uri: Any
     for uri in data if isinstance(data, list) else []:
@@ -1185,8 +1168,8 @@ def mesh_lookup(term: str, match: str) -> list[str]:
     return out
 
 
-def cmd_mesh(args: argparse.Namespace) -> int:
-    """执行 mesh 子命令：逐个校验术语是否为 MeSH 主题词。
+async def _cmd_mesh_async(args: argparse.Namespace) -> int:
+    """执行 mesh 子命令（协程版）：逐个校验术语是否为 MeSH 主题词。
 
     对每个术语先 exact 匹配；未命中再 contains 匹配取前 5 个建议词，
     并取每个 descriptor 的官方标签，输出结构化 JSON 供检索式构造参考。
@@ -1204,36 +1187,55 @@ def cmd_mesh(args: argparse.Namespace) -> int:
     if not terms:
         print("[mesh] 未提供任何术语", file=sys.stderr)
         return 1
+    limiter: AsyncRateLimiter = AsyncRateLimiter(None)
     results: list[dict[str, Any]] = []
-    for term in terms:
-        entry: dict[str, Any] = {
-            "term": term,
-            "status": "not_found",
-            "descriptor_id": "",
-            "label": "",
-            "suggestions": [],
-        }
-        try:
-            hits: list[str] = mesh_lookup(term, "exact")
-            if hits:
-                entry["status"] = "exact"
-                entry["descriptor_id"] = hits[0]
-                entry["label"] = _mesh_descriptor_label(hits[0])
-            else:
-                sugg: list[str] = mesh_lookup(term, "contains")[:5]
-                if sugg:
-                    entry["status"] = "suggest"
-                    entry["suggestions"] = [
-                        {"descriptor_id": s, "label": _mesh_descriptor_label(s)}
-                        for s in sugg
-                    ]
-        except Exception as e:
-            entry["status"] = "error"
-            entry["error"] = str(e)
-        results.append(entry)
-        print(f"[mesh] {term}: {entry['status']}", file=sys.stderr)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT}
+    ) as session:
+        for term in terms:
+            entry: dict[str, Any] = {
+                "term": term,
+                "status": "not_found",
+                "descriptor_id": "",
+                "label": "",
+                "suggestions": [],
+            }
+            try:
+                hits: list[str] = await mesh_lookup(session, term, "exact", limiter)
+                if hits:
+                    entry["status"] = "exact"
+                    entry["descriptor_id"] = hits[0]
+                    entry["label"] = await _mesh_descriptor_label(session, hits[0], limiter)
+                else:
+                    sugg: list[str] = (await mesh_lookup(session, term, "contains", limiter))[:5]
+                    if sugg:
+                        entry["status"] = "suggest"
+                        entry["suggestions"] = [
+                            {
+                                "descriptor_id": s,
+                                "label": await _mesh_descriptor_label(session, s, limiter),
+                            }
+                            for s in sugg
+                        ]
+            except Exception as e:
+                entry["status"] = "error"
+                entry["error"] = str(e)
+            results.append(entry)
+            print(f"[mesh] {term}: {entry['status']}", file=sys.stderr)
     _dump({"mesh_check": results}, args.out)
     return 0
+
+
+def cmd_mesh(args: argparse.Namespace) -> int:
+    """mesh 子命令入口：在独立事件循环中跑协程版实现。
+
+    参数:
+        args: mesh 子命令的命名空间。
+
+    返回:
+        进程退出码。
+    """
+    return asyncio.run(_cmd_mesh_async(args))
 
 
 # ---------------------------------------------------------------------------

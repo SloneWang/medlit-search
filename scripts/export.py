@@ -22,6 +22,9 @@ import json
 import re
 import sys
 from typing import Any, Callable
+
+# 版本标识（与 SKILL.md 保持一致）
+__version__: str = 1.7
 from xml.sax.saxutils import escape as xml_escape
 
 # ---------------------------------------------------------------------------
