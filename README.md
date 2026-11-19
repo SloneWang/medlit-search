@@ -344,13 +344,13 @@ medlit-search/
 
 ## 更新日志
 
-### v1.8（2026-10-20）
+### v1.8（2026-11-19）
 
 - **每步 docx**：各步主 markdown 完成后，用 **Agent 自带文档技能**另存同名 `.docx`；本 Skill 不实现/不依赖 docx 转换库；
 - **研究报告**：第 5 步完成或流程走完后生成 `研究报告/研究报告.md` + `.docx`（题目背景、PICO、方法、结果表、讨论、结论、局限、参考文献）；**每次复筛或完整重跑后优化该报告**并更新版本说明；
 - 版本号全库对齐 v1.8。
 
-### v1.7（2026-10-20）
+### v1.7（2026-11-05）
 
 - **通用化**：去除 WorkBuddy 专属路径与工具标识，安装说明覆盖 MiMo Desktop / WorkBuddy / Claude Code 等；`tool=medlit_search`、UA `medlit-search/1.7`；
 - **版本统一**：SKILL / README / docs / 脚本注释对齐，脚本增加 `__version__`；
