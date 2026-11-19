@@ -11,7 +11,7 @@ pubmed.py — PubMed (NCBI E-utilities) 检索 / 拉取 / MeSH 校验工具
       1) 发表日期用 DP（实际发表日期），SciSearch 误用 MHDA（MeSH 标引日期）
       2) F# 解析器 List.pairwise 会丢失每条记录最后一个属性，此处修复
 
-IO 模型（v1.7 起 aiohttp 原生协程）：
+IO 模型（v1.8 起 aiohttp 原生协程）：
   - 全部 HTTP 走 aiohttp.ClientSession；AsyncRateLimiter 保证请求起步间隔
     （无 key 3 req/s，有 key 10 req/s），asyncio.Semaphore 限制在途请求数
     （无 key 3 / 有 key 10）；
@@ -67,14 +67,14 @@ from typing import Any
 import aiohttp
 
 # 版本标识（与 SKILL.md 保持一致）
-__version__: str = "1.7"
+__version__: str = "1.8"
 
 # NCBI E-utilities 各工具的统一入口前缀
 EUTILS: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 # NLM MeSH RDF lookup API（校验术语用，无需 API key）
 MESH_LOOKUP: str = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
 # User-Agent：NCBI 要求客户端标识自己，便于其追踪滥用来源
-USER_AGENT: str = "medlit-search/1.7 (PubMed literature screening)"
+USER_AGENT: str = "medlit-search/1.8 (PubMed literature screening)"
 
 # NCBI 建议 EFetch 单批不超过 200 个 UID（URL 过长会失败）
 MAX_EFETCH_BATCH: int = 200

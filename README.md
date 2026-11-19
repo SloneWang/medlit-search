@@ -7,7 +7,7 @@
 
 检索流程移植自作者的桌面文献检索工具 **SciSearch**（C#/F#），并对其中解析与 API 语义问题做了修正。
 
-**v1.7** 全面通用化：不绑定任何单一 Agent 产品，可安装到 MiMo Desktop / MiMoCode、WorkBuddy、Claude Code 等支持 SKILL.md 的 Agent。
+**v1.8**：在 v1.7 跨 Agent 通用化基础上，增加每步 markdown→docx（用 Agent 自带文档能力）与课题级研究报告（md+docx，复筛后迭代优化）。不绑定任何单一 Agent 产品，可安装到 MiMo Desktop / MiMoCode、WorkBuddy、Claude Code 等支持 SKILL.md 的 Agent。
 
 ## 功能与亮点
 
@@ -248,11 +248,11 @@
 
 ## 安装
 
-**从 `v1.7` 稳定标签安装**（`main` 为开发分支）：
+**从 `v1.8` 稳定标签安装**（`main` 为开发分支）：
 
 ```bash
 # 通用：克隆到你的 Agent 技能目录
-git clone -b v1.7 https://github.com/SloneWang/medlit-search.git <skills目录>/medlit-search
+git clone -b v1.8 https://github.com/SloneWang/medlit-search.git <skills目录>/medlit-search
 
 # 常见 Agent 路径示例
 # MiMo Desktop / MiMoCode:  ~/.config/mimocode/skills/medlit-search
@@ -299,7 +299,7 @@ python scripts/export.py --input "04-初筛/初筛结果.json" --format gbt7714 
 
 ```
 medlit-search/
-├── SKILL.md                  # Agent 技能定义（六步逐步中断流程，v1.7）
+├── SKILL.md                  # Agent 技能定义（六步逐步中断流程，v1.8）
 ├── README.md                 # 本文件（含流程图）
 ├── requirements.txt          # 依赖：aiohttp、openpyxl
 ├── scripts/
@@ -336,20 +336,27 @@ medlit-search/
 | 版本 | 说明 |
 |---|---|
 | `main` | 开发分支 |
-| `v1.7` | **当前稳定标签（推荐安装）**：跨 Agent 通用化、aiohttp 异步 HTTP、复筛强制读全文、提示词精简、版本统一；**已锁定** |
+| `v1.8` | **当前开发版**：每步 md→docx（Agent 自带能力）、研究报告 md+docx 与复筛迭代优化 |
+| `v1.7` | 跨 Agent 通用化、aiohttp 异步 HTTP、复筛强制读全文、提示词精简、版本统一；已锁定 |
 | `v1.6` | 强制参数确认、中文分步文件夹、`_revN` 修订、IO 协程化；已锁定 |
 | `v1.5` | 逐步中断六步工作流 + 多源合并去重；已锁定 |
 | `v1.4` | 全量类型注解；已锁定 |
 
 ## 更新日志
 
+### v1.8（2026-10-20）
+
+- **每步 docx**：各步主 markdown 完成后，用 **Agent 自带文档技能**另存同名 `.docx`；本 Skill 不实现/不依赖 docx 转换库；
+- **研究报告**：第 5 步完成或流程走完后生成 `研究报告/研究报告.md` + `.docx`（题目背景、PICO、方法、结果表、讨论、结论、局限、参考文献）；**每次复筛或完整重跑后优化该报告**并更新版本说明；
+- 版本号全库对齐 v1.8。
+
 ### v1.7（2026-10-20）
 
 - **通用化**：去除 WorkBuddy 专属路径与工具标识，安装说明覆盖 MiMo Desktop / WorkBuddy / Claude Code 等；`tool=medlit_search`、UA `medlit-search/1.7`；
-- **版本统一**：SKILL / README / docs / 脚本注释全部对齐 v1.7，脚本增加 `__version__`；
-- **提示词精简**：六步工作流压缩冗余表述；新增「执行隔离」（禁止读历史记忆/偏好）；停止协议强化（每步结束必须停，任何模型不得自动续跑）；复筛强制：有全文必须通读原文再判定；
-- **代码异步化**：删除同步 `RateLimiter` / `http_get` / `http_post`，HTTP 全部改为 `aiohttp` 协程（`pubmed.py` / `download.py` / `fulltext.py`）；`mesh` 子命令协程化；依赖显式声明于 `requirements.txt` 与 SKILL.md；
-- **文档**：README 增加用户使用流程与内部执行流程图（内联 SVG 绘制，多列紧凑布局，不依赖 Mermaid 渲染）。
+- **版本统一**：SKILL / README / docs / 脚本注释对齐，脚本增加 `__version__`；
+- **提示词精简**：六步工作流压缩冗余；新增「执行隔离」；停止协议强化；复筛强制读全文；
+- **代码异步化**：HTTP 全部改为 `aiohttp` 协程；依赖显式声明于 `requirements.txt` 与 SKILL.md；
+- **文档**：README 增加用户使用流程与内部执行流程图。
 
 ### v1.6（2026-09-17）
 

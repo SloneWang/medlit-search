@@ -12,7 +12,7 @@ download.py — 开放获取（OA）原文下载
   <outdir>/<PMID>_<标题slug>.pdf （或 .tgz）
   <outdir>/manifest.json  每篇状态：downloaded / not_oa / error
 
-IO 模型（v1.7 aiohttp 原生协程）：每篇下载作为一个 asyncio.Task，
+IO 模型（v1.8 aiohttp 原生协程）：每篇下载作为一个 asyncio.Task，
 asyncio.Semaphore 限制在途下载数（MAX_DOWNLOAD_CONCURRENCY=2），
 AsyncRateLimiter 保证总请求 ≤3 req/s。全部 HTTP 走 aiohttp.ClientSession。
 依赖：aiohttp、Python 标准库。
@@ -35,10 +35,10 @@ from typing import IO, Any
 import aiohttp
 
 # 版本标识（与 SKILL.md 保持一致）
-__version__: str = "1.7"
+__version__: str = "1.8"
 
 # HTTP 请求 User-Agent，便于 NCBI 识别工具来源
-USER_AGENT: str = "medlit-search/1.7 (PMC OA download)"
+USER_AGENT: str = "medlit-search/1.8 (PMC OA download)"
 # PMC OA 服务：按 PMCID 查 PDF/tgz 下载链接
 OA_FCGI: str = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
 # ID 转换服务：PMID -> PMCID
@@ -212,7 +212,7 @@ def candidate_urls(href: str) -> list[str]:
 
     迁移适配背景（2026-04 NCBI 调整）：/pub/pmc/ 下的 oa_package、oa_pdf、
     oa_bulk 已迁入 /pub/pmc/deprecated/（2026-08 后旧路径彻底下线），
-    因此 deprecated 路径作为第一候选优先尝试。v1.7 起 HTTP 层为 aiohttp，
+    因此 deprecated 路径作为第一候选优先尝试。v1.8 起 HTTP 层为 aiohttp，
     仅支持 http(s)，ftp 候选改写为等价 https://ftp.ncbi.nlm.nih.gov/ 路径。
 
     参数:

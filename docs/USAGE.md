@@ -1,6 +1,6 @@
 # 使用文档 · medlit-search
 
-> 适用版本：v1.7 · 数据源：PubMed（NCBI E-utilities）；支持导入 RIS / BibTeX / MEDLINE
+> 适用版本：v1.8 · 数据源：PubMed（NCBI E-utilities）；支持导入 RIS / BibTeX / MEDLINE
 >
 > 用户使用流程与内部执行流程图见 [README.md](../README.md#用户使用流程)。
 
@@ -22,7 +22,7 @@
 **要求**：Python ≥ 3.10（3.13 已验证）。
 
 ```bash
-git clone -b v1.7 https://github.com/SloneWang/medlit-search.git
+git clone -b v1.8 https://github.com/SloneWang/medlit-search.git
 cd medlit-search
 pip install -r requirements.txt
 ```

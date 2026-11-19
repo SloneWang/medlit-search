@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-import.py — 将外部文献列表导入为 skill 统一 JSON（medlit-search v1.7）
+import.py — 将外部文献列表导入为 skill 统一 JSON（medlit-search v1.8）
 
 支持格式（--format）：
   - ris     : RIS（Zotero / EndNote / NoteExpress 通用导出）
@@ -31,7 +31,7 @@ import time
 from typing import Any
 
 # 版本标识（与 SKILL.md 保持一致）
-__version__: str = 1.7
+__version__: str = "1.8"
 
 # 复用 pubmed.py 的 MEDLINE 解析器，避免重复实现
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

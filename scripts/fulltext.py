@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fulltext.py — 复筛全文准备器（v1.7）
+fulltext.py — 复筛全文准备器（v1.8）
 
 用途：为"全文层面复筛"把全文文件凑齐，再由 LLM 直接读文件判定。
   1. 优先索引用户自己提供的 PDF/DOCX/TXT/...（按 DOI > PMID > PMC > 标题 匹配）
@@ -18,7 +18,7 @@ CLI:
                      [--outdir papers/] [--email <邮箱>] [--no-download]
                      --out fulltext_manifest.csv
 
-IO 模型（v1.7 aiohttp 原生协程）：需要走网络补全的文献各为一个 asyncio.Task，
+IO 模型（v1.8 aiohttp 原生协程）：需要走网络补全的文献各为一个 asyncio.Task，
 asyncio.Semaphore 限制在途下载数（_MAX_OA_CONCURRENCY=2），任务起步按
 _PACE_INTERVAL=0.6s 节流；Unpaywall 请求与下载全部走 aiohttp.ClientSession。
 manifest 行仍按文献池原顺序汇总。依赖：aiohttp、Python 标准库。
@@ -47,7 +47,7 @@ except Exception:  # noqa: BLE001
     _dl = None  # type: ignore
 
 # 版本标识（与 SKILL.md 保持一致）
-__version__: str = "1.7"
+__version__: str = "1.8"
 
 # 文献字典的类型别名
 Paper = dict[str, Any]
